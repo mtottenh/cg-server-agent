@@ -55,6 +55,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Renew the client certificate over the established mTLS channel
+    /// (run before the 90-day expiry; no token needed)
+    Renew {
+        /// Agents vhost base URL (e.g. https://agents.portal.example.com)
+        #[arg(long)]
+        url: String,
+        /// Directory holding client.key / client.pem / portal-ca.pem
+        #[arg(long, default_value = "/etc/portal/agent")]
+        dir: String,
+    },
     /// Exchange a one-time enrollment token for a client certificate
     Enroll {
         /// One-time enrollment token (minted by a portal admin)
@@ -84,6 +94,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Enroll { token, url, dir }) => enroll::enroll(&url, &token, &dir).await,
+        Some(Command::Renew { url, dir }) => enroll::renew(&url, &dir).await,
         None => {
             anyhow::ensure!(!cli.url.is_empty(), "PORTAL_AGENT_URL is required");
             anyhow::ensure!(

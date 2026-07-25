@@ -247,11 +247,19 @@ async fn execute_command(config: &RunConfig, frame: CommandFrame) -> Result<Stri
                         "spec" => "spec",
                         _ => "team1",
                     };
-                    let name = entry["name"].as_str().unwrap_or("player");
+                    // Display names are arbitrary user data: sanitize
+                    // instead of rejecting (a ';' in a name must not park
+                    // the substitution forever — review minor).
+                    let raw_name = entry["name"].as_str().unwrap_or("player");
+                    let name: String = raw_name
+                        .chars()
+                        .filter(|c| !matches!(c, '"' | ';' | '\n' | '\r'))
+                        .collect();
+                    let name = if name.trim().is_empty() { "player" } else { name.trim() };
                     let out = rcon::exec(
                         &config.rcon_addr,
                         &config.rcon_password,
-                        &format!("matchzy_addplayer {steam} {team} {}", console_quote(name)?),
+                        &format!("matchzy_addplayer {steam} {team} \"{name}\""),
                     )
                     .await?;
                     outputs.push(out);

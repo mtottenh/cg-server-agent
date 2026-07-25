@@ -84,3 +84,70 @@ pub async fn enroll(portal_url: &str, token: &str, dir: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// Renew the certificate over the established mTLS channel (§5.3 step 4):
+/// authenticates with the CURRENT cert, submits a fresh CSR from a new
+/// keypair, and atomically swaps the material on success.
+pub async fn renew(agents_base_url: &str, dir: &str) -> Result<()> {
+    let dir_path = Path::new(dir);
+    let cert_pem = std::fs::read(dir_path.join("client.pem")).context("reading client.pem")?;
+    let key_pem = std::fs::read(dir_path.join("client.key")).context("reading client.key")?;
+    let ca_pem = std::fs::read(dir_path.join("portal-ca.pem")).context("reading portal-ca.pem")?;
+
+    // reqwest identity: key + cert concatenated.
+    let mut identity_pem = key_pem.clone();
+    identity_pem.extend_from_slice(&cert_pem);
+    let identity =
+        reqwest::Identity::from_pem(&identity_pem).context("building client identity")?;
+    let ca_cert = reqwest::Certificate::from_pem(&ca_pem).context("parsing portal CA")?;
+
+    let new_key = rcgen::KeyPair::generate().context("generating new keypair")?;
+    let csr_pem = rcgen::CertificateParams::default()
+        .serialize_request(&new_key)
+        .context("building CSR")?
+        .pem()
+        .context("encoding CSR")?;
+
+    let url = format!(
+        "{}/v1/gameserver/renew",
+        agents_base_url.trim_end_matches('/')
+    );
+    let client = reqwest::Client::builder()
+        .identity(identity)
+        .add_root_certificate(ca_cert)
+        .build()
+        .context("building https client")?;
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({ "csr_pem": csr_pem }))
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("renewal rejected ({status}): {body}");
+    }
+    #[derive(Deserialize)]
+    struct RenewResponse {
+        certificate_pem: String,
+        expires_at: String,
+    }
+    let renewed: RenewResponse = response.json().await.context("parsing renew response")?;
+
+    std::fs::write(dir_path.join("client.key"), new_key.serialize_pem())
+        .context("writing new client.key")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dir_path.join("client.key"),
+            std::fs::Permissions::from_mode(0o600),
+        )?;
+    }
+    std::fs::write(dir_path.join("client.pem"), &renewed.certificate_pem)
+        .context("writing new client.pem")?;
+    println!("Certificate renewed; valid until {}", renewed.expires_at);
+    println!("Restart the agent to reconnect with the new certificate.");
+    Ok(())
+}

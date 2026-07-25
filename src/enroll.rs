@@ -55,7 +55,10 @@ pub async fn enroll(portal_url: &str, token: &str, dir: &str) -> Result<()> {
     write("client.pem", &enrolled.certificate_pem, 0o644)?;
     write("portal-ca.pem", &enrolled.ca_certificate_pem, 0o644)?;
 
-    println!("Enrolled as server {} ({})", enrolled.server_name, enrolled.server_id);
+    println!(
+        "Enrolled as server {} ({})",
+        enrolled.server_name, enrolled.server_id
+    );
     println!("Certificate valid until {}", enrolled.expires_at);
     println!("Material written to {dir}/ (client.key, client.pem, portal-ca.pem)");
     println!();

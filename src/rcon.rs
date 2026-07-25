@@ -30,7 +30,11 @@ async fn write_packet(stream: &mut TcpStream, id: i32, ptype: i32, body: &str) -
     let body_bytes = body.as_bytes();
     let size = 4 + 4 + body_bytes.len() + 2;
     let mut buf = Vec::with_capacity(4 + size);
-    buf.extend_from_slice(&i32::try_from(size).context("packet too large")?.to_le_bytes());
+    buf.extend_from_slice(
+        &i32::try_from(size)
+            .context("packet too large")?
+            .to_le_bytes(),
+    );
     buf.extend_from_slice(&id.to_le_bytes());
     buf.extend_from_slice(&ptype.to_le_bytes());
     buf.extend_from_slice(body_bytes);

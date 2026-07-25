@@ -74,16 +74,15 @@ async fn connect_and_serve(config: &RunConfig) -> Result<()> {
                 "PORTAL_AGENT_CERT/KEY/CA are required (or --dev-server-id for dev mode)"
             ),
         };
-        Some(tokio_tungstenite::Connector::Rustls(crate::tls::client_config(
-            cert, key, ca,
-        )?))
+        Some(tokio_tungstenite::Connector::Rustls(
+            crate::tls::client_config(cert, key, ca)?,
+        ))
     };
 
-    let (ws, _response) = tokio_tungstenite::connect_async_tls_with_config(
-        request, None, false, connector,
-    )
-    .await
-    .context("websocket connect")?;
+    let (ws, _response) =
+        tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector)
+            .await
+            .context("websocket connect")?;
     tracing::info!(url = %config.portal_url, "connected to portal");
 
     let (mut sink, mut stream) = ws.split();

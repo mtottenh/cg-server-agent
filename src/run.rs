@@ -194,6 +194,71 @@ async fn execute_command(config: &RunConfig, frame: CommandFrame) -> Result<Stri
         }
         "end_match" => "css_endmatch".to_string(),
         "status" => "get5_status".to_string(),
+        "load_backup" => {
+            let args = frame.args.as_ref().context("load_backup requires args")?;
+            let url = args["url"].as_str().context("missing url")?;
+            let header_name = args["header_name"].as_str().unwrap_or("");
+            let header_value = args["header_value"].as_str().unwrap_or("");
+            if header_name.is_empty() {
+                format!("matchzy_loadbackup_url {}", console_quote(url)?)
+            } else {
+                format!(
+                    "matchzy_loadbackup_url {} {} {}",
+                    console_quote(url)?,
+                    console_quote(header_name)?,
+                    console_quote(header_value)?
+                )
+            }
+        }
+        "roster_edit" => {
+            // Remove-then-add so the listed count never exceeds
+            // players_per_team; outputs are concatenated.
+            let args = frame.args.as_ref().context("roster_edit requires args")?;
+            let mut outputs = Vec::new();
+            if let Some(remove) = args["remove"].as_array() {
+                for steam in remove {
+                    let steam = steam
+                        .as_str()
+                        .context("remove entries are steamid64 strings")?;
+                    anyhow::ensure!(
+                        steam.chars().all(|c| c.is_ascii_digit()),
+                        "invalid steamid64 in remove list"
+                    );
+                    let out = rcon::exec(
+                        &config.rcon_addr,
+                        &config.rcon_password,
+                        &format!("matchzy_removeplayer {steam}"),
+                    )
+                    .await?;
+                    outputs.push(out);
+                }
+            }
+            if let Some(add) = args["add"].as_array() {
+                for entry in add {
+                    let steam = entry["steamid64"]
+                        .as_str()
+                        .context("add entries need steamid64")?;
+                    anyhow::ensure!(
+                        steam.chars().all(|c| c.is_ascii_digit()),
+                        "invalid steamid64 in add list"
+                    );
+                    let team = match entry["team"].as_str().unwrap_or("team1") {
+                        "team2" => "team2",
+                        "spec" => "spec",
+                        _ => "team1",
+                    };
+                    let name = entry["name"].as_str().unwrap_or("player");
+                    let out = rcon::exec(
+                        &config.rcon_addr,
+                        &config.rcon_password,
+                        &format!("matchzy_addplayer {steam} {team} {}", console_quote(name)?),
+                    )
+                    .await?;
+                    outputs.push(out);
+                }
+            }
+            return Ok(outputs.join("\n"));
+        }
         "exec" => {
             let args = frame.args.as_ref().context("exec requires args")?;
             args["command"]

@@ -15,6 +15,10 @@ struct EnrollResponse {
     certificate_pem: String,
     ca_certificate_pem: String,
     expires_at: String,
+    #[serde(default)]
+    demo_token: String,
+    #[serde(default)]
+    demo_upload_url: String,
 }
 
 pub async fn enroll(portal_url: &str, token: &str, dir: &str) -> Result<()> {
@@ -67,5 +71,16 @@ pub async fn enroll(portal_url: &str, token: &str, dir: &str) -> Result<()> {
     println!("  PORTAL_AGENT_CERT={dir}/client.pem");
     println!("  PORTAL_AGENT_KEY={dir}/client.key");
     println!("  PORTAL_AGENT_CA={dir}/portal-ca.pem");
+    if !enrolled.demo_token.is_empty() {
+        println!();
+        println!("Add to csgo/cfg/MatchZy/config.cfg (server-scoped demo upload, survives");
+        println!("cvar restores - do NOT put these in per-match cvars):");
+        println!("  matchzy_demo_upload_url \"{}\"", enrolled.demo_upload_url);
+        println!("  matchzy_demo_upload_header_key \"Authorization\"");
+        println!(
+            "  matchzy_demo_upload_header_value \"Bearer {}\"",
+            enrolled.demo_token
+        );
+    }
     Ok(())
 }

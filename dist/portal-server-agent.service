@@ -1,0 +1,26 @@
+[Unit]
+Description=Portal game-server agent (MatchZy control channel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=portal-agent
+Group=portal-agent
+DynamicUser=yes
+EnvironmentFile=/etc/portal/portal-server-agent.env
+ExecStart=/usr/bin/portal-server-agent
+Restart=always
+RestartSec=5
+
+# Hardening (mirrors the portal service units)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/etc/portal/agent
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

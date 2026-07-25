@@ -1,0 +1,43 @@
+[package]
+name = "portal-server-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Game-server agent: outbound mTLS control channel between a CS2/MatchZy host and the community gaming portal"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+rustls = "0.23"
+rustls-pemfile = "2"
+rcgen = { version = "0.13", features = ["pem"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[package.metadata.deb]
+name = "portal-server-agent"
+maintainer = "Gaming Portal Ops <ops@gaming-portal.invalid>"
+copyright = "2026, Gaming Portal"
+extended-description = """\
+Runs on a CS2 game-server host beside MatchZy. Maintains an outbound \
+mTLS WebSocket to the portal, executes match-setup commands via local \
+RCON, and reports get5_status heartbeats. The portal never connects \
+inbound and never stores RCON credentials."""
+depends = "$auto, ca-certificates"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/portal-server-agent", "usr/bin/portal-server-agent", "755"],
+    ["dist/portal-server-agent.env.example", "etc/portal/portal-server-agent.env.example", "0644"],
+]
+systemd-units = [
+    { unit-name = "portal-server-agent", unit-scripts = "dist", enable = true, start = false, restart-after-upgrade = true },
+]

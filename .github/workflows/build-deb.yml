@@ -100,7 +100,7 @@ jobs:
           test -x /usr/bin/portal-server-agent
           # postinst ran: user exists, env seeded from example
           getent passwd portal-agent
-          test -f /etc/portal/portal-server-agent.env
+          sudo test -f /etc/portal/portal-server-agent.env
           # unit shipped AND enabled (start=false is intentional — the
           # service is useless before `enroll`)
           systemctl is-enabled portal-server-agent
@@ -110,7 +110,7 @@ jobs:
       - name: Purge is clean
         run: |
           sudo dpkg --purge portal-server-agent
-          ! test -e /etc/portal/portal-server-agent.env
+          ! sudo test -e /etc/portal/portal-server-agent.env
           ! getent passwd portal-agent
 
   # Attach to the GitHub release only after the smoke install passed.

@@ -58,6 +58,24 @@ pub async fn enroll(portal_url: &str, token: &str, dir: &str) -> Result<()> {
     write("client.key", &key.serialize_pem(), 0o600)?;
     write("client.pem", &enrolled.certificate_pem, 0o644)?;
     write("portal-ca.pem", &enrolled.ca_certificate_pem, 0o644)?;
+    if !enrolled.demo_token.is_empty() {
+        // Persisted (not just printed) so configuration management can wire
+        // MatchZy idempotently on any later run — the demo token is only
+        // ever returned by this one enroll response.
+        write(
+            "matchzy_portal.cfg",
+            &format!(
+                "// Written by portal-server-agent enroll. Server-scoped demo\n\
+                 // upload settings for csgo/cfg/MatchZy/config.cfg — do NOT\n\
+                 // put these in per-match cvars.\n\
+                 matchzy_demo_upload_url \"{}\"\n\
+                 matchzy_demo_upload_header_key \"Authorization\"\n\
+                 matchzy_demo_upload_header_value \"Bearer {}\"\n",
+                enrolled.demo_upload_url, enrolled.demo_token
+            ),
+            0o640,
+        )?;
+    }
     chown_to_service_user(dir);
 
     println!(
@@ -82,6 +100,8 @@ pub async fn enroll(portal_url: &str, token: &str, dir: &str) -> Result<()> {
             "  matchzy_demo_upload_header_value \"Bearer {}\"",
             enrolled.demo_token
         );
+        println!();
+        println!("(Also written to {dir}/matchzy_portal.cfg for config management.)");
     }
     Ok(())
 }

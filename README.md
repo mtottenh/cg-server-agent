@@ -56,6 +56,26 @@ revocation registry. Rotation is automatic-in-design (re-enrollment over
 the established channel — Phase 4); until then re-run `enroll` with a fresh
 token before the 90-day expiry.
 
+## Local metrics (optional)
+
+Set `METRICS_ADDR=127.0.0.1:9469` to expose a loopback Prometheus
+`/metrics` endpoint for this game host's operator:
+
+| Metric | Meaning |
+|---|---|
+| `agent_ws_connected` | 1 while the portal WebSocket is up |
+| `agent_reconnects_total` | Reconnect attempts (any disconnect) |
+| `agent_backoff_seconds` | Current reconnect backoff (0 while connected) |
+| `agent_heartbeats_sent_total` | Heartbeats delivered to the portal |
+| `agent_rcon_commands_total{command,outcome}` | Portal-issued commands by verb and result |
+| `agent_rcon_duration_seconds{command}` | Command execution time (RCON round-trips) |
+| `agent_build_info{version}` | Installed agent version |
+
+This endpoint is for local diagnostics only — the portal monitors agents
+through its own heartbeat aggregation and never scrapes game hosts. Demo
+uploads don't appear here because the agent never handles demo files:
+MatchZy uploads them straight to the portal.
+
 ## Dev mode
 
 Against a local portal (`PORTAL_AGENT_INSECURE=true` on the API):

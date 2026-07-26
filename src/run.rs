@@ -47,8 +47,11 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 tracing::warn!(error = %e, "connection failed");
             }
         }
+        metrics::gauge!("agent_ws_connected").set(0.0);
+        metrics::counter!("agent_reconnects_total").increment(1);
         let jitter = rand::rng().random_range(0..=backoff_secs);
         let wait = backoff_secs + jitter;
+        metrics::gauge!("agent_backoff_seconds").set(wait as f64);
         tracing::info!(seconds = wait, "reconnecting after backoff");
         tokio::time::sleep(Duration::from_secs(wait)).await;
         backoff_secs = (backoff_secs * 2).min(60);
@@ -84,6 +87,8 @@ async fn connect_and_serve(config: &RunConfig) -> Result<()> {
             .await
             .context("websocket connect")?;
     tracing::info!(url = %config.portal_url, "connected to portal");
+    metrics::gauge!("agent_ws_connected").set(1.0);
+    metrics::gauge!("agent_backoff_seconds").set(0.0);
 
     let (mut sink, mut stream) = ws.split();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(config.heartbeat_secs));
@@ -96,6 +101,7 @@ async fn connect_and_serve(config: &RunConfig) -> Result<()> {
                 if sink.send(Message::Text(frame.to_string().into())).await.is_err() {
                     return Ok(());
                 }
+                metrics::counter!("agent_heartbeats_sent_total").increment(1);
             }
             msg = stream.next() => {
                 match msg {
@@ -168,7 +174,25 @@ async fn handle_frame(config: &RunConfig, text: &str) -> Option<serde_json::Valu
         }
     };
     let id = frame.id.clone();
-    match execute_command(config, frame).await {
+    // Bounded `command` label: the known portal verbs only, never the raw
+    // string (a hostile portal frame must not mint metric series).
+    let command = match frame.cmd.as_str() {
+        c @ ("load_match" | "end_match" | "status" | "load_backup" | "roster_edit" | "exec") => c,
+        _ => "unknown",
+    }
+    .to_owned();
+    let start = std::time::Instant::now();
+    let result = execute_command(config, frame).await;
+    metrics::histogram!("agent_rcon_duration_seconds", "command" => command.clone())
+        .record(start.elapsed().as_secs_f64());
+    let outcome = if result.is_ok() { "ok" } else { "error" };
+    metrics::counter!(
+        "agent_rcon_commands_total",
+        "command" => command,
+        "outcome" => outcome,
+    )
+    .increment(1);
+    match result {
         Ok(output) => Some(json!({ "id": id, "ok": true, "output": output })),
         Err(e) => Some(json!({ "id": id, "ok": false, "error": e.to_string() })),
     }

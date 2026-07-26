@@ -21,6 +21,10 @@ serde_json = "1"
 rand = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Local diagnostics only (observability-design.md §4.6): loopback /metrics
+# for the game-host operator; the portal never scrapes agents.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
 
 [package.metadata.deb]
 name = "portal-server-agent"

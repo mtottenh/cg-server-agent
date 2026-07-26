@@ -1,4 +1,11 @@
-//! rustls client configuration: portal-CA pinning + client certificate.
+//! rustls client configuration: client certificate (portal-CA-signed) +
+//! server verification against the public webpki roots AND the portal CA.
+//!
+//! The server side of the trust is deliberately NOT pinned to the portal
+//! CA alone: the agents vhost terminates TLS with an ACME (Let's Encrypt)
+//! certificate — public DNS identity — while the mTLS guarantee lives in
+//! the OTHER direction (Caddy verifying our client cert against the
+//! portal CA). Pinning only the portal CA made every connection fail.
 
 use anyhow::{Context, Result, bail};
 use std::sync::Arc;
@@ -9,7 +16,9 @@ pub fn client_config(
     ca_path: &str,
 ) -> Result<Arc<rustls::ClientConfig>> {
     let ca_pem = std::fs::read(ca_path).with_context(|| format!("reading {ca_path}"))?;
-    let mut roots = rustls::RootCertStore::empty();
+    let mut roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
     for cert in rustls_pemfile::certs(&mut ca_pem.as_slice()) {
         roots
             .add(cert.context("parsing CA certificate")?)

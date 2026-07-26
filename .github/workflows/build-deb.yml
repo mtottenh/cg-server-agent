@@ -1,0 +1,134 @@
+name: build-deb
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch, tag, or SHA)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # create/upload the release
+
+# One build per ref at a time; never cancel a release build midway.
+concurrency:
+  group: build-deb-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # A tag on a broken commit must not publish a deb.
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The deb version comes from Cargo.toml, NOT the tag — a mismatched
+      # tag would silently publish a differently-versioned deb and every
+      # downstream `just deploy vX.Y.Z` glob would install the wrong thing.
+      - name: Tag matches Cargo version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_V=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "portal-server-agent") | .version')
+          if [ "$TAG" != "$CARGO_V" ]; then
+            echo "::error::tag v$TAG != Cargo.toml version $CARGO_V — bump the version, re-tag, and push again"
+            exit 1
+          fi
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Build deb
+        run: cargo deb --no-build
+
+      - name: Stage artifacts + checksums
+        run: |
+          mkdir -p out
+          cp target/debian/*.deb out/
+          (cd out && sha256sum *.deb > SHA256SUMS)
+          ls -la out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portal-server-agent-deb
+          path: out/*
+          if-no-files-found: error
+
+  # Install the deb on a clean runner: catches a missing postinst, a unit
+  # shipped without enable hooks (the silent cargo-deb unit-scripts trap),
+  # and an unseeded env file — all failure modes this repo has had.
+  smoke:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: portal-server-agent-deb
+          path: out
+
+      - name: Checksums verify
+        run: cd out && sha256sum -c SHA256SUMS
+
+      - name: Install
+        run: sudo apt-get install -y ./out/portal-server-agent_*.deb
+
+      - name: Package sanity
+        run: |
+          set -x
+          dpkg-query -W portal-server-agent
+          test -x /usr/bin/portal-server-agent
+          # postinst ran: user exists, env seeded from example
+          getent passwd portal-agent
+          test -f /etc/portal/portal-server-agent.env
+          # unit shipped AND enabled (start=false is intentional — the
+          # service is useless before `enroll`)
+          systemctl is-enabled portal-server-agent
+          systemd-analyze verify /usr/lib/systemd/system/portal-server-agent.service \
+            || systemd-analyze verify /lib/systemd/system/portal-server-agent.service
+
+      - name: Purge is clean
+        run: |
+          sudo dpkg --purge portal-server-agent
+          ! test -e /etc/portal/portal-server-agent.env
+          ! getent passwd portal-agent
+
+  # Attach to the GitHub release only after the smoke install passed.
+  # softprops creates the release if the tag push is the first sighting.
+  release:
+    needs: smoke
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: portal-server-agent-deb
+          path: out
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/*.deb
+            out/SHA256SUMS
+          fail_on_unmatched_files: true

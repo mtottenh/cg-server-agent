@@ -1,0 +1,53 @@
+#!/bin/sh
+set -e
+
+# cargo-deb injects dh_installsystemd-style snippets below the #DEBHELPER#
+# marker for enabling the unit (start = false in Cargo.toml — the service
+# is useless until `enroll` has run and the env file is filled in).
+# Everything above is our own setup: user, directories, conf file.
+
+case "$1" in
+    configure)
+        # Dedicated system user. This runs on a CS2 game host, not the
+        # portal box, so there is no shared `portal` user here.
+        if ! getent passwd portal-agent >/dev/null; then
+            adduser --system --group \
+                --home /nonexistent \
+                --no-create-home \
+                --shell /usr/sbin/nologin \
+                --gecos "Portal game-server agent" \
+                portal-agent
+        fi
+
+        # Config directory. Readable by the portal-agent group only.
+        install -d -o root -g portal-agent -m 0750 /etc/portal
+
+        # First-install: seed the env file from the example so the unit has
+        # an EnvironmentFile to read (it will fail on the change-me RCON
+        # password, but that's an actionable failure). Never clobbered on
+        # upgrade.
+        if [ ! -f /etc/portal/portal-server-agent.env ]; then
+            cp /etc/portal/portal-server-agent.env.example /etc/portal/portal-server-agent.env
+            chown root:portal-agent /etc/portal/portal-server-agent.env
+            chmod 0640 /etc/portal/portal-server-agent.env
+            echo "portal-server-agent: seeded /etc/portal/portal-server-agent.env from example — edit, enroll, then systemctl start portal-server-agent"
+        fi
+
+        # If `enroll` ran before the package was (re)installed, make sure the
+        # service user can read its own material.
+        if [ -d /etc/portal/agent ]; then
+            chown -R portal-agent:portal-agent /etc/portal/agent
+            chmod 0750 /etc/portal/agent
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1\`" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#

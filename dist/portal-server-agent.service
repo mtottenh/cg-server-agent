@@ -5,9 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Static system user created by the deb postinst. NOT DynamicUser: the
+# enrollment material in /etc/portal/agent is written by `enroll` (run as
+# root) and chowned to portal-agent — a transient UID could never read it.
 User=portal-agent
 Group=portal-agent
-DynamicUser=yes
 EnvironmentFile=/etc/portal/portal-server-agent.env
 ExecStart=/usr/bin/portal-server-agent
 Restart=always
@@ -18,7 +20,9 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadOnlyPaths=/etc/portal/agent
+# `-` = tolerate the path not existing yet: the dir is created by `enroll`,
+# which may run after the first `systemctl start` attempt.
+ReadOnlyPaths=-/etc/portal/agent
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 MemoryMax=256M
 

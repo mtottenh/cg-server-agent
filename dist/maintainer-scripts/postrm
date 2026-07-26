@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        # Only on `dpkg --purge`, not `apt remove`. Remove exactly what this
+        # package owns: its env file and the enrollment material. /etc/portal
+        # itself is left alone in case anything else uses it on this host.
+        rm -f /etc/portal/portal-server-agent.env
+        rm -rf /etc/portal/agent
+        rmdir /etc/portal 2>/dev/null || true
+        if getent passwd portal-agent >/dev/null; then
+            deluser --quiet --system portal-agent || true
+        fi
+        if getent group portal-agent >/dev/null; then
+            delgroup --quiet --system portal-agent 2>/dev/null || true
+        fi
+        ;;
+
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+
+    *)
+        echo "postrm called with unknown argument \`$1\`" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#

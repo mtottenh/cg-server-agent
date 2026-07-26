@@ -58,6 +58,7 @@ pub async fn enroll(portal_url: &str, token: &str, dir: &str) -> Result<()> {
     write("client.key", &key.serialize_pem(), 0o600)?;
     write("client.pem", &enrolled.certificate_pem, 0o644)?;
     write("portal-ca.pem", &enrolled.ca_certificate_pem, 0o644)?;
+    chown_to_service_user(dir);
 
     println!(
         "Enrolled as server {} ({})",
@@ -83,6 +84,41 @@ pub async fn enroll(portal_url: &str, token: &str, dir: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Hand the material to the service user. `enroll` is documented as run
+/// under sudo (the README), so everything lands root-owned — but the unit
+/// runs as the static `portal-agent` user the deb postinst creates. Without
+/// this the service can never read its own client key. Best-effort: on a
+/// host without the deb (dev box, container) the user doesn't exist and we
+/// silently skip; a failed chown warns with the manual command.
+fn chown_to_service_user(dir: &str) {
+    const USER: &str = "portal-agent";
+    let user_exists = std::process::Command::new("getent")
+        .args(["passwd", USER])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !user_exists {
+        return;
+    }
+    let spec = format!("{USER}:{USER}");
+    let ok = std::process::Command::new("chown")
+        .args(["-R", &spec, dir])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        // Group needs to traverse the dir; the 0600 on client.key stands.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750));
+        }
+        println!("Ownership of {dir} handed to {USER} (the service user)");
+    } else {
+        eprintln!("warning: could not chown {dir} — run: chown -R {spec} {dir}");
+    }
 }
 
 /// Renew the certificate over the established mTLS channel (§5.3 step 4):
@@ -147,6 +183,7 @@ pub async fn renew(agents_base_url: &str, dir: &str) -> Result<()> {
     }
     std::fs::write(dir_path.join("client.pem"), &renewed.certificate_pem)
         .context("writing new client.pem")?;
+    chown_to_service_user(dir);
     println!("Certificate renewed; valid until {}", renewed.expires_at);
     println!("Restart the agent to reconnect with the new certificate.");
     Ok(())

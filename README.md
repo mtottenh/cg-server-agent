@@ -18,8 +18,13 @@ connects inbound and never sees the RCON password.
 ## Install
 
 ```bash
-# 1. Install the deb (from the portal's GitHub releases)
+# 1. Install the deb — download from the latest release + verify:
+#    https://github.com/mtottenh/cg-server-agent/releases
+#    (sha256sum -c SHA256SUMS with both files in cwd)
 sudo apt install ./portal-server-agent_*.deb
+#    postinst creates the portal-agent system user, seeds
+#    /etc/portal/portal-server-agent.env from the example, and enables
+#    (but does not start) the unit.
 
 # 2. Enroll: a portal admin mints a one-time token
 #    (admin UI → Game Servers → Enrollment token, or
@@ -28,13 +33,14 @@ sudo portal-server-agent enroll \
     --url https://portal.example.com \
     --token cgs_... \
     --dir /etc/portal/agent
+#    Material lands in /etc/portal/agent owned by portal-agent (enroll
+#    chowns it to the service user automatically when the deb is installed).
 
 # 3. Configure
-sudo cp /etc/portal/portal-server-agent.env.example /etc/portal/portal-server-agent.env
 sudo $EDITOR /etc/portal/portal-server-agent.env   # URL + RCON password
 
 # 4. Start
-sudo systemctl enable --now portal-server-agent
+sudo systemctl start portal-server-agent
 ```
 
 The server flips from `offline` to `available` in the portal admin UI on

@@ -38,6 +38,14 @@ assets = [
     ["target/release/portal-server-agent", "usr/bin/portal-server-agent", "755"],
     ["dist/portal-server-agent.env.example", "etc/portal/portal-server-agent.env.example", "0644"],
 ]
+# postinst creates the portal-agent user and seeds the env file; without
+# this cargo-deb ships the unit with no user behind it and the service can
+# never start. (Pattern shared with the portal-api/scanner/demo-stats debs.)
+maintainer-scripts = "dist/maintainer-scripts"
+# `unit-scripts` MUST point at the dir holding portal-server-agent.service —
+# cargo-deb otherwise searches maintainer-scripts/, finds no unit, and
+# silently ships it with no systemctl enable hooks. start = false: the unit
+# is useless until `enroll` has run, so we enable but never auto-start.
 systemd-units = [
     { unit-name = "portal-server-agent", unit-scripts = "dist", enable = true, start = false, restart-after-upgrade = true },
 ]

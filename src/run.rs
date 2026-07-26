@@ -255,7 +255,11 @@ async fn execute_command(config: &RunConfig, frame: CommandFrame) -> Result<Stri
                         .chars()
                         .filter(|c| !matches!(c, '"' | ';' | '\n' | '\r'))
                         .collect();
-                    let name = if name.trim().is_empty() { "player" } else { name.trim() };
+                    let name = if name.trim().is_empty() {
+                        "player"
+                    } else {
+                        name.trim()
+                    };
                     let out = rcon::exec(
                         &config.rcon_addr,
                         &config.rcon_password,

@@ -11,7 +11,7 @@ mod rcon;
 mod run;
 mod tls;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -51,6 +51,34 @@ struct Cli {
     /// DEV ONLY: authenticate with X-Dev-Server-Id instead of mTLS
     #[arg(long, env = "PORTAL_AGENT_DEV_SERVER_ID")]
     dev_server_id: Option<String>,
+
+    /// Loopback Prometheus /metrics listener for local diagnostics
+    /// (e.g. 127.0.0.1:9469); empty/unset = disabled. Never expose this
+    /// publicly — the portal monitors agents via its own heartbeat
+    /// aggregation, not by scraping.
+    #[arg(long, env = "METRICS_ADDR")]
+    metrics_addr: Option<String>,
+}
+
+/// Install the loopback Prometheus exporter when `METRICS_ADDR` is set.
+fn install_metrics(addr: &str) -> Result<()> {
+    let addr: std::net::SocketAddr = addr
+        .parse()
+        .with_context(|| format!("invalid METRICS_ADDR {addr:?}"))?;
+    metrics_exporter_prometheus::PrometheusBuilder::new()
+        .with_http_listener(addr)
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full("agent_rcon_duration_seconds".into()),
+            // One TCP connect + exec round-trip per command, 5s IO timeout;
+            // roster edits chain several round-trips.
+            &[0.005, 0.025, 0.1, 0.5, 1.0, 2.5, 5.0, 15.0],
+        )
+        .context("bucket config")?
+        .install()
+        .context("start metrics exporter")?;
+    metrics::gauge!("agent_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
+    tracing::info!(%addr, "metrics exporter listening");
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -101,6 +129,9 @@ async fn main() -> Result<()> {
                 !cli.rcon_password.is_empty(),
                 "RCON_PASSWORD is required (start the CS2 server with -usercon)"
             );
+            if let Some(addr) = cli.metrics_addr.as_deref().filter(|a| !a.trim().is_empty()) {
+                install_metrics(addr)?;
+            }
             run::run(run::RunConfig {
                 portal_url: cli.url,
                 cert_path: cli.cert,

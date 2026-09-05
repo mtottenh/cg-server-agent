@@ -89,6 +89,18 @@ portal-server-agent \
 
 ## Protocol
 
-Portal → agent: `{id, cmd: load_match|end_match|exec|status, args}`.
+Portal → agent: `{id, cmd: load_match|end_match|exec|status|load_backup|roster_edit, args}`.
 Agent → portal: `{id, ok, output|error}` plus
-`{type: "heartbeat", agent_version, rcon_ok, get5_status}` every 30s.
+`{type: "heartbeat", agent_version, rcon_ok, get5_status, status_output}` every 30s,
+where `status_output` (0.2.0+) is the raw output of CS2's `status`, bounded to 8 KiB —
+the portal parses it for the current map and the connected players.
+
+`exec` runs one console command per frame. The agent refuses, with
+`{ok: false, error: "refused: …"}`, anything containing `;` or control
+characters, and any command whose verb is portal-owned (`rcon_password`,
+`sv_password`, `tv_password`, `sv_rcon_*`, `matchzy_remote_*`,
+`matchzy_demo_upload_*`, `matchzy_loadmatch*`, `matchzy_loadbackup_url`,
+`logaddress_*`, `sv_downloadurl`, `host_writeconfig`), could hide another
+command (`alias`, `exec`), or would end the process (`quit`, `exit`,
+`_restart`, `killserver`, `crash`). The portal applies the same rule first;
+this copy is defence in depth.

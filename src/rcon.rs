@@ -1,11 +1,16 @@
 //! Minimal Source RCON client (CS2 dedicated server, `-usercon`).
 //!
 //! Implements only what the agent needs: authenticate, execute one command,
-//! collect the (possibly multi-packet) response. Multi-packet termination
-//! uses the canonical sentinel trick: after the command we send an empty
-//! `SERVERDATA_RESPONSE_VALUE` request with a distinct id — the server
-//! processes requests in order, so seeing the sentinel id echoed back means
-//! the real response is complete.
+//! collect the (possibly multi-packet) response.
+//!
+//! Termination cannot use the classic SRCDS sentinel trick (an empty
+//! `SERVERDATA_RESPONSE_VALUE` echoed back under a distinct id). CS2 tags
+//! every response packet with the id of the LAST request it saw and sends
+//! no distinct empty terminator, so the command output arrives under the
+//! sentinel's id and is indistinguishable from it by id alone — the reason
+//! a real host was needed to shake this out. Instead we follow the command
+//! with a bogus command carrying a unique token; the server answers
+//! `Unknown command '<token>'`, an end marker no real output can contain.
 
 use anyhow::{Context, Result, bail};
 use std::time::Duration;
@@ -89,23 +94,86 @@ pub async fn exec(addr: &str, password: &str, command: &str) -> Result<String> {
         }
     }
 
-    // Execute + sentinel.
+    // Execute, then a unique end marker (see the module docs). We ignore
+    // packet ids entirely and read until the marker's echo appears.
+    let marker = format!("cgm_end_{:032x}", rand::random::<u128>());
     write_packet(&mut stream, 10, SERVERDATA_EXECCOMMAND, command).await?;
-    write_packet(&mut stream, 11, SERVERDATA_RESPONSE_VALUE, "").await?;
+    write_packet(&mut stream, 11, SERVERDATA_EXECCOMMAND, &marker).await?;
 
-    let mut response = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let needle = marker.as_bytes();
     loop {
         let packet = read_packet(&mut stream).await?;
-        if packet.id == 11 {
-            break;
+        if packet.ptype != SERVERDATA_RESPONSE_VALUE {
+            continue;
         }
-        if packet.id == 10 && packet.ptype == SERVERDATA_RESPONSE_VALUE {
-            response.extend_from_slice(&packet.body);
-            if response.len() > MAX_RESPONSE_BYTES {
-                bail!("rcon response exceeded {MAX_RESPONSE_BYTES} bytes");
-            }
+        buf.extend_from_slice(&packet.body);
+        if buf.len() > MAX_RESPONSE_BYTES {
+            bail!("rcon response exceeded {MAX_RESPONSE_BYTES} bytes");
+        }
+        if contains_subslice(&buf, needle) {
+            break;
         }
     }
 
-    Ok(String::from_utf8_lossy(&response).into_owned())
+    Ok(strip_marker(&String::from_utf8_lossy(&buf), &marker))
+}
+
+/// Whether `needle` occurs in `haystack`. Inputs are a few KiB at most.
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Drop the end marker (and the `Unknown command '` wrapper the server puts
+/// around it) plus any trailing whitespace, leaving the real output.
+fn strip_marker(text: &str, marker: &str) -> String {
+    match text.find(marker) {
+        Some(idx) => {
+            const WRAPPER: &str = "Unknown command '";
+            let cut = if text[..idx].ends_with(WRAPPER) {
+                idx - WRAPPER.len()
+            } else {
+                idx
+            };
+            text[..cut].trim_end().to_string()
+        }
+        None => text.trim_end().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{contains_subslice, strip_marker};
+
+    #[test]
+    fn strips_the_marker_and_its_wrapper() {
+        let m = "cgm_end_abc";
+        let out = format!("map     : de_mirage\n#end\nUnknown command '{m}'!\n");
+        assert_eq!(strip_marker(&out, m), "map     : de_mirage\n#end");
+    }
+
+    #[test]
+    fn strips_a_bare_marker_without_a_wrapper() {
+        assert_eq!(
+            strip_marker("output here\ncgm_end_x tail", "cgm_end_x"),
+            "output here"
+        );
+    }
+
+    #[test]
+    fn without_the_marker_only_trailing_space_is_trimmed() {
+        assert_eq!(
+            strip_marker("plain output\n\n", "cgm_end_x"),
+            "plain output"
+        );
+    }
+
+    #[test]
+    fn subslice_search_matches_across_a_split() {
+        assert!(contains_subslice(b"aaMARKERbb", b"MARKER"));
+        assert!(!contains_subslice(b"aaaa", b"MARKER"));
+        assert!(!contains_subslice(b"x", b""));
+    }
 }

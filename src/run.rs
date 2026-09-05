@@ -125,17 +125,30 @@ async fn connect_and_serve(config: &RunConfig) -> Result<()> {
 }
 
 /// Build the heartbeat frame: RCON reachability + raw `get5_status` JSON.
+/// The most of CS2's `status` output a heartbeat carries. A full server
+/// prints well under this; the bound keeps a runaway console from bloating
+/// every heartbeat.
+const STATUS_OUTPUT_MAX: usize = 8 * 1024;
+
 async fn heartbeat_frame(config: &RunConfig) -> serde_json::Value {
     match rcon::exec(&config.rcon_addr, &config.rcon_password, "get5_status").await {
         Ok(output) => {
             // get5_status prints a single JSON object; tolerate surrounding
             // console noise by extracting the outermost braces.
             let status = extract_json(&output);
+            // CS2's own `status` is what knows the map and who is connected
+            // (get5_status has neither). Forwarded raw and bounded: the
+            // format is CS2's, and the portal parses it in one place.
+            let status_output = rcon::exec(&config.rcon_addr, &config.rcon_password, "status")
+                .await
+                .ok()
+                .map(|o| truncate_chars(&o, STATUS_OUTPUT_MAX));
             json!({
                 "type": "heartbeat",
                 "agent_version": env!("CARGO_PKG_VERSION"),
                 "rcon_ok": true,
                 "get5_status": status,
+                "status_output": status_output,
             })
         }
         Err(e) => {
@@ -147,6 +160,73 @@ async fn heartbeat_frame(config: &RunConfig) -> serde_json::Value {
             })
         }
     }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated]", &s[..end])
+}
+
+/// Why a raw `exec` command is refused, if it is.
+///
+/// The portal holds the RCON password, the webhook and demo URLs and the
+/// match lifecycle; a portal bug or a hostile admin session must not be
+/// able to rotate the password, repoint the webhooks or drop the box out
+/// from under a match through the passthrough. The portal applies the same
+/// rule first; this copy is defence in depth. One command per frame: `;`
+/// and control characters are refused so the check sees a single verb.
+pub fn exec_refusal(command: &str) -> Option<String> {
+    if command.chars().any(|c| c.is_control()) {
+        return Some("control characters are not allowed".to_string());
+    }
+    if command.contains(';') {
+        return Some("one command per request; ';' is not allowed".to_string());
+    }
+    let verb = command
+        .trim_start()
+        .split(|c: char| c.is_whitespace())
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if verb.is_empty() {
+        return Some("empty command".to_string());
+    }
+    const PORTAL_OWNED: &[&str] = &[
+        "rcon_password",
+        "sv_password",
+        "tv_password",
+        "matchzy_loadmatch_url",
+        "matchzy_loadmatch",
+        "matchzy_loadbackup_url",
+        "sv_downloadurl",
+        "host_writeconfig",
+    ];
+    const PORTAL_OWNED_PREFIXES: &[&str] = &[
+        "sv_rcon_",
+        "matchzy_remote_",
+        "matchzy_demo_upload_",
+        "logaddress_",
+    ];
+    const NO_ESCAPE: &[&str] = &["alias", "exec"];
+    const PROCESS: &[&str] = &["quit", "exit", "_restart", "killserver", "crash"];
+    if PORTAL_OWNED.contains(&verb.as_str())
+        || PORTAL_OWNED_PREFIXES.iter().any(|p| verb.starts_with(p))
+    {
+        return Some(format!("{verb} is portal-owned"));
+    }
+    if NO_ESCAPE.contains(&verb.as_str()) {
+        return Some(format!("{verb} could run commands the check cannot see"));
+    }
+    if PROCESS.contains(&verb.as_str()) {
+        return Some(format!("{verb} would end the server process"));
+    }
+    None
 }
 
 fn extract_json(output: &str) -> Option<serde_json::Value> {
@@ -297,14 +377,76 @@ async fn execute_command(config: &RunConfig, frame: CommandFrame) -> Result<Stri
         }
         "exec" => {
             let args = frame.args.as_ref().context("exec requires args")?;
-            args["command"]
+            let command = args["command"]
                 .as_str()
                 .context("missing command")?
-                .to_string()
+                .to_string();
+            if let Some(reason) = exec_refusal(&command) {
+                anyhow::bail!("refused: {reason}");
+            }
+            command
         }
         other => anyhow::bail!("unknown command: {other}"),
     };
 
     tracing::info!(cmd = %frame.cmd, "executing");
     rcon::exec(&config.rcon_addr, &config.rcon_password, &command).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_console_commands_pass() {
+        for c in [
+            "status",
+            "mp_warmuptime 60",
+            "changelevel de_mirage",
+            "host_workshop_map 3070284539",
+            "say \"gl hf\"",
+        ] {
+            assert_eq!(exec_refusal(c), None, "{c}");
+        }
+    }
+
+    #[test]
+    fn portal_owned_cvars_are_refused_whatever_the_case() {
+        for c in [
+            "rcon_password hunter2",
+            "RCON_PASSWORD x",
+            "sv_password x",
+            "tv_password x",
+            "sv_rcon_whitelist_address 1.2.3.4",
+            "matchzy_remote_log_url https://evil",
+            "matchzy_demo_upload_url https://evil",
+            "matchzy_loadmatch_url https://evil",
+            "logaddress_add 1.2.3.4:1234",
+        ] {
+            assert!(
+                exec_refusal(c).is_some_and(|r| r.contains("portal-owned")),
+                "{c}"
+            );
+        }
+    }
+
+    #[test]
+    fn escapes_and_process_commands_are_refused() {
+        assert!(exec_refusal("alias x rcon_password y").is_some());
+        assert!(exec_refusal("exec server.cfg").is_some());
+        assert!(exec_refusal("quit").is_some());
+        assert!(exec_refusal("_restart").is_some());
+        assert!(exec_refusal("mp_warmuptime 60; rcon_password x").is_some());
+        assert!(exec_refusal("status\r").is_some());
+        assert!(exec_refusal("   ").is_some());
+    }
+
+    #[test]
+    fn truncation_keeps_char_boundaries() {
+        let s = "é".repeat(10);
+        let t = truncate_chars(&s, 5);
+        assert!(t.starts_with("éé"));
+        assert!(t.ends_with("[truncated]"));
+        assert_eq!(truncate_chars("short", 100), "short");
+    }
 }

@@ -117,7 +117,7 @@ jobs:
           test -f /usr/lib/systemd/system/portal-gs-update@.service
           test -f /usr/share/polkit-1/rules.d/50-portal-gs-update.rules
           test -f /usr/lib/tmpfiles.d/portal-gs-update.conf
-          test -f /etc/portal/gs-update.conf.example
+          sudo test -f /etc/portal/gs-update.conf.example
           systemd-analyze verify portal-gs-update@check.service
           # postinst: state dir, and the runtime dir via tmpfiles (sticky,
           # group-writable by the agent for request.json)

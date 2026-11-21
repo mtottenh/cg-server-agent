@@ -32,6 +32,7 @@ bad() {
     current_failed=1
     echo "    FAIL: $*"
 }
+notice() { echo "    note: $*"; }
 eq() { # eq <what> <expected> <actual>
     [ "$2" = "$3" ] || bad "$1: expected '$2', got '$3'"
 }
@@ -89,6 +90,7 @@ setup() {
 
     printf '"AppState"\n{\n\t"appid"\t\t"730"\n\t"buildid"\t\t"1000"\n}\n' >"$GS/serverfiles/steamapps/appmanifest_730.acf"
     echo 1000 >"$FAKE/remote_build"
+    echo running >"$FAKE/running"
     # gameinfo.gi has CRLF line endings, like the real one.
     printf '"GameInfo"\r\n{\r\n\tFileSystem\r\n\t{\r\n\t\tSearchPaths\r\n\t\t{\r\n\t\t\tGame_LowViolence\tcsgo_lv\r\n\t\t\tGame\tcsgo/addons/metamod\r\n\t\t\tGame\tcsgo\r\n\t\t\tGame\tcsgo_imported\r\n\t\t}\r\n\t}\r\n}\r\n' >"$CSGO/gameinfo.gi"
 
@@ -717,39 +719,60 @@ test_lock_refuses_to_follow_a_planted_link() {
 
 test_request_file_supplies_the_job_id() {
     local id=0b0e3c5e-7f0a-4c1d-9b7e-1a2b3c4d5e6f
-    echo "{\"job_id\": \"$id\", \"operation\": \"repair-config\", \"trigger\": \"auto_repair\"}" >"$RUN/request.json"
+    request() { # request <operation> [created_at] — as the agent writes it
+        echo "{\"job_id\": \"$id\", \"operation\": \"$1\", \"trigger\": \"auto_repair\", \"created_at\": ${2:-$(date +%s)}}" >"$RUN/request.json"
+    }
+    # A run from cron or by hand never looks at it: an orphaned request (the
+    # unit start failed) must not hand its job id to someone else's job.
+    request repair-config
     helper repair-config
+    eq "exit status (local run)" 0 "$RC"
+    [ "$(st .job_id)" != "$id" ] || bad "a run without --unit adopted the request"
+    st_eq .trigger local
+    [ -e "$RUN/request.json" ] || bad "a local run must leave the request alone"
+
+    # The unit does.
+    helper --unit repair-config
     eq "exit status" 0 "$RC"
     st_eq .job_id "$id"
     st_eq .trigger auto_repair
     [ ! -e "$RUN/request.json" ] || bad "request.json should be consumed"
 
     # A request for another operation is not ours: left alone, id generated.
-    echo "{\"job_id\": \"$id\", \"operation\": \"mods\"}" >"$RUN/request.json"
-    helper check
+    request mods
+    helper --unit check
     eq "exit status" 0 "$RC"
     [ "$(st .job_id)" != "$id" ] || bad "check must not take a mods request's job id"
     st_eq .trigger local
     [ -e "$RUN/request.json" ] || bad "another operation's request should be left in place"
 
     # A job id that is not a uuid never reaches the state file.
-    echo '{"job_id": "$(touch /tmp/pwned)", "operation": "check"}' >"$RUN/request.json"
+    echo "{\"job_id\": \"\$(touch /tmp/pwned)\", \"operation\": \"check\", \"created_at\": $(date +%s)}" >"$RUN/request.json"
     cp "$RUN/state.json" "$T/state.before"
-    helper check
+    helper --unit check
     eq "exit status" 65 "$RC"
     cmp -s "$T/state.before" "$RUN/state.json" || bad "a rejected request must not touch state.json"
     [ ! -e "$RUN/request.json" ] || bad "a rejected request should be removed"
 
     echo 'not json' >"$RUN/request.json"
-    helper check
+    helper --unit check
     eq "exit status (garbage)" 65 "$RC"
 
-    # Stale request (helper never ran for it): discarded.
-    echo "{\"job_id\": \"$id\", \"operation\": \"check\"}" >"$RUN/request.json"
-    touch -d '10 minutes ago' "$RUN/request.json"
-    helper check
-    eq "exit status (stale)" 0 "$RC"
-    [ "$(st .job_id)" != "$id" ] || bad "a stale request must not be honoured"
+    # Older than a minute (the start it was written for never happened), from
+    # the future, or without a timestamp: discarded, not honoured.
+    local stamp
+    for stamp in "$(($(date +%s) - 61))" "$(($(date +%s) + 600))" '"yesterday"' null; do
+        request check "$stamp"
+        helper --unit check
+        eq "exit status (stale: $stamp)" 0 "$RC"
+        [ "$(st .job_id)" != "$id" ] || bad "a stale request ($stamp) must not be honoured"
+        [ ! -e "$RUN/request.json" ] || bad "a stale request ($stamp) should be removed"
+    done
+    request check "$(($(date +%s) - 50))"
+    helper --unit check
+    st_eq .job_id "$id"
+    helper --unit
+    eq "exit status (--unit without an operation)" 64 "$RC"
 }
 
 test_log_tail_is_bounded() {
@@ -804,18 +827,24 @@ test_planted_state_link_is_never_read() {
     # The reviewer's case: publishing fails (tmpfs full / not writable), so
     # the planted link survives. last-job.json must still be the job's own
     # record, not a copy of whatever the link points at.
-    rm -f "$RUN/state.json" "$RUN/config.json" "$STATE/last-job.json"
-    ln -s "$T/victim" "$RUN/state.json"
-    chmod 0555 "$RUN"
-    helper repair-config
-    chmod 0755 "$RUN"
-    eq "exit status (publish impossible)" 0 "$RC"
-    [ -L "$RUN/state.json" ] || bad "test setup: the link should have survived"
-    hasnt "$STATE/last-job.json" 'root-only-secret-content'
-    eq "last-job.json status" succeeded "$(jq -r .status "$STATE/last-job.json")"
-    eq "last-job.json says publishing failed" true "$(jq -r .state_publish_failed "$STATE/last-job.json")"
-    has "$OUT" 'cannot publish state.json'
-    eq "link target untouched" 'root-only-secret-content' "$(cat "$T/victim")"
+    if [ "$(id -u)" = 0 ]; then
+        # Root writes to a 0555 directory regardless. (The root container
+        # run covers this case with a full tmpfs instead.)
+        notice "publish-failure case skipped: running as root, a read-only directory does not stop root"
+    else
+        rm -f "$RUN/state.json" "$RUN/config.json" "$STATE/last-job.json"
+        ln -s "$T/victim" "$RUN/state.json"
+        chmod 0555 "$RUN"
+        helper repair-config
+        chmod 0755 "$RUN"
+        eq "exit status (publish impossible)" 0 "$RC"
+        [ -L "$RUN/state.json" ] || bad "test setup: the link should have survived"
+        hasnt "$STATE/last-job.json" 'root-only-secret-content'
+        eq "last-job.json status" succeeded "$(jq -r .status "$STATE/last-job.json")"
+        eq "last-job.json says publishing failed" true "$(jq -r .state_publish_failed "$STATE/last-job.json")"
+        has "$OUT" 'cannot publish state.json'
+        eq "link target untouched" 'root-only-secret-content' "$(cat "$T/victim")"
+    fi
     # A directory or FIFO planted at the name is cleared too.
     rm -f "$RUN/state.json"
     mkdir "$RUN/state.json"
@@ -877,8 +906,8 @@ test_unreadable_snapshot_does_not_delete_the_live_tree() {
     helper mods
     eq "exit status" 1 "$RC"
     st_eq .status failed
-    [[ $(st .error) == *'restoring the snapshot'*'also failed'* ]] || bad "error: $(st .error)"
-    has "$OUT" 'snapshot is missing or unreadable - leaving the current files in place'
+    [[ $(st .error) == *'restoring the snapshot'*'also failed: the snapshot is missing or unreadable; the current files were left in place; the server was started on those files' ]] || bad "error: $(st .error)"
+    has "$OUT" 'the snapshot is missing or unreadable; the current files were left in place'
     # The update's files are still there — a broken plugin set, not an empty tree.
     [ -d "$CSGO/addons/metamod" ] || bad "addons/ was deleted"
     eq "updated files left in place" 0.9.3 "$(cat "$CSGO/addons/matchzy/VERSION")"
@@ -1027,23 +1056,23 @@ test_untrusted_inputs_are_not_followed_or_overread() {
 
     # request.json: a link, a FIFO, a directory, or something big → 65, at once.
     ln -s "$T/other" "$RUN/request.json"
-    helper repair-config
+    helper --unit repair-config
     eq "exit status (symlink request)" 65 "$RC"
     hasnt "$OUT" SECRET-OTHER-FILE
     [ ! -L "$RUN/request.json" ] || bad "the planted request link should be removed"
     mkfifo "$RUN/request.json"
     t0=$SECONDS
-    helper repair-config
+    helper --unit repair-config
     eq "exit status (fifo request)" 65 "$RC"
     [ $((SECONDS - t0)) -lt 8 ] || bad "a FIFO request stalled the helper"
     mkdir "$RUN/request.json"
-    helper repair-config
+    helper --unit repair-config
     eq "exit status (directory request)" 65 "$RC"
-    { printf '{"operation":"repair-config","job_id":"11111111-2222-4333-8444-555555555555","pad":"'; head -c 5000 /dev/zero | tr '\0' 'x'; printf '"}'; } >"$RUN/request.json"
-    helper repair-config
+    { printf '{"operation":"repair-config","job_id":"11111111-2222-4333-8444-555555555555","created_at":'"$(date +%s)"',"pad":"'; head -c 5000 /dev/zero | tr '\0' 'x'; printf '"}'; } >"$RUN/request.json"
+    helper --unit repair-config
     eq "exit status (oversized request)" 65 "$RC"
-    echo '{"job_id":["a"],"operation":"repair-config"}' >"$RUN/request.json"
-    helper repair-config
+    echo "{\"job_id\":[\"a\"],\"operation\":\"repair-config\",\"created_at\":$(date +%s)}" >"$RUN/request.json"
+    helper --unit repair-config
     eq "exit status (job_id not a string)" 65 "$RC"
     eq "work dirs left" 0 "$(find "$STATE" -maxdepth 1 -name '.work.*' | wc -l)"
 }
@@ -1197,6 +1226,208 @@ test_config_and_gameinfo_are_replaced_by_rename() {
     [ ! -e "$CSGO/gameinfo.gi.bak-2020-01-01-000000" ] || bad "the oldest backup should be gone"
     [ -e "$CSGO/gameinfo.gi.bak-2020-01-07-000000" ] || bad "a recent backup was pruned"
     eq "temp files left" 0 "$(find "$CSGO" -name '*.portal-tmp' | wc -l)"
+}
+
+# --- adversarial review, round 2 ---------------------------------------------
+
+# M1. A LinuxGSM command that times out must not leave what it started
+#     running while the job moves on. The harness has no runuser, so the
+#     fake detaches a process the way `runuser -l` does (its own session).
+test_timed_out_command_leaves_no_orphans_but_spares_tmux() {
+    cp "$(command -v sleep)" "$FAKE/tmux" # stands in for LinuxGSM's tmux server
+    touch "$FAKE/orphan"
+    echo 2000 >"$FAKE/remote_build"
+    EXTRA_ENV=GS_UPDATE_LGSM_TIMEOUT=2 helper game
+    eq "exit status" 1 "$RC"
+    st_eq .status failed
+    st_eq .failed_phase game-update
+    has "$OUT" 'did not finish within 2s and was stopped'
+    has "$OUT" 'stopping processes the LinuxGSM command left behind'
+    if pgrep -f 'sleep 37' >/dev/null; then
+        bad "the detached process the timed-out command started is still running"
+        pkill -f 'sleep 37'
+    fi
+    # The game server lives in a tmux server: never that.
+    if pgrep -f "$FAKE/tmux 38" >/dev/null; then
+        pkill -f "$FAKE/tmux 38"
+    else
+        bad "the tmux server was killed along with the orphans"
+    fi
+}
+
+# L1. Interrupting an update that had nothing to do must not claim a restart.
+test_sigterm_during_a_noop_game_update_reports_no_restart() {
+    echo 30 >"$FAKE/slow" # no new build: LinuxGSM never stops the server
+    helper_bg game
+    local pid=$! t0=$SECONDS
+    wait_for_phase game-update 'SteamCMD downloading'
+    kill -TERM "$pid"
+    wait "$pid"
+    eq "exit status" 143 "$?"
+    st_eq .status failed
+    st_eq .restarted false
+    st_eq .load null
+    [[ $(st .error) == *'plugin files were not touched; the server was still running and was left as it is' ]] || bad "error: $(st .error)"
+    eq "calls" 'update,start,' "$(calls)"
+    hasnt "$OUT" 'did not load'
+    [ $((SECONDS - t0)) -lt 8 ] || bad "recovery waited $((SECONDS - t0))s for load lines that could not come"
+}
+
+# L2. Rolling back keeps the failed build's plugin logs.
+test_rollback_keeps_the_failed_builds_logs() {
+    mkdir -p "$CSGO/addons/counterstrikesharp/logs" "$FAKE/mods_next/addons/counterstrikesharp/logs"
+    echo 'before the update' >"$CSGO/addons/counterstrikesharp/logs/log-old.txt"
+    echo 'why the new build failed' >"$FAKE/mods_next/addons/counterstrikesharp/logs/log-new.txt"
+    touch "$FAKE/mods_next/addons/BROKEN"
+    helper mods
+    st_eq .status rolled_back
+    eq "plugin files restored" 0.9.2 "$(cat "$CSGO/addons/matchzy/VERSION")"
+    eq "the failed build's log" 'why the new build failed' "$(cat "$CSGO/addons/counterstrikesharp/logs/log-new.txt" 2>/dev/null)"
+    eq "the earlier log" 'before the update' "$(cat "$CSGO/addons/counterstrikesharp/logs/log-old.txt" 2>/dev/null)"
+    [ ! -e "$CSGO/addons/BROKEN" ] || bad "the failed update's files should be gone"
+    eq "no staging left" 0 "$(find "$CSGO" -maxdepth 1 -name '.portal-*' | wc -l)"
+}
+
+# L3. A restore that fails half way is undone, cleaned up and described.
+test_restore_failing_between_members_is_undone() {
+    if [ "$(id -u)" = 0 ]; then
+        notice "skipped: running as root, a read-only directory does not stop root"
+        return 0
+    fi
+    touch "$FAKE/lock_cfg" "$FAKE/mods_next/addons/BROKEN"
+    helper mods
+    chmod 0755 "$CSGO/cfg"
+    eq "exit status" 1 "$RC"
+    st_eq .status failed
+    [[ $(st .error) == *'also failed: could not move the current cfg/MatchZy aside; nothing was restored, the updated files are all in place; the server was started on those files' ]] \
+        || bad "error: $(st .error)"
+    # Not a mixed tree: addons was swapped first, then put back.
+    eq "addons are the updated ones again" 0.9.3 "$(cat "$CSGO/addons/matchzy/VERSION")"
+    [ -e "$CSGO/addons/BROKEN" ] || bad "addons should be back to the updated set"
+    eq "config is the updated one" 'mp_overtime_enable 0' "$(cat "$CSGO/cfg/MatchZy/live.cfg")"
+    eq "no staging left" 0 "$(find "$CSGO" -maxdepth 1 -name '.portal-*' | wc -l)"
+    eq "calls" 'stop,mods-update,start,stop,start,' "$(calls)"
+}
+
+# L4. The phase that broke is the one reported.
+test_failed_game_update_is_reported_at_its_phase() {
+    echo 3 >"$FAKE/update_rc"
+    helper game
+    eq "exit status" 1 "$RC"
+    st_eq .status failed
+    st_eq .failed_phase game-update
+    [[ $(st .error) == 'LinuxGSM update exited with status 3' ]] || bad "error: $(st .error)"
+    : >"$FAKE/calls"
+    helper all
+    eq "exit status (all)" 1 "$RC"
+    st_eq .failed_phase game-update
+    [[ $(st .error) == *'exited with status 3; plugins were not updated' ]] || bad "error: $(st .error)"
+    eq "calls" 'update-lgsm,stop,update,start,' "$(calls)"
+    eq "plugins untouched" 0.9.2 "$(cat "$CSGO/addons/matchzy/VERSION")"
+}
+
+# Nothing read from the game tree may hang the helper (and with it the lock).
+test_a_fifo_in_the_game_tree_does_not_hang_the_helper() {
+    rm "$CFG"
+    mkfifo "$CFG"
+    local t0=$SECONDS
+    helper verify-config
+    eq "exit status" 0 "$RC"
+    cfg_eq .demo_upload_wired false
+    [[ $(jq -r .reason "$RUN/config.json") == *'not a readable regular file'* ]] || bad "reason: $(jq -r .reason "$RUN/config.json")"
+    helper repair-config
+    eq "exit status (repair)" 1 "$RC"
+    st_eq .status failed
+    [ -p "$CFG" ] || bad "the FIFO should not have been written through or replaced"
+    [ $((SECONDS - t0)) -lt 10 ] || bad "a FIFO at config.cfg stalled the helper for $((SECONDS - t0))s"
+    rm "$CFG"
+    cp "$FAKE/mods_next/cfg/MatchZy/config.cfg" "$CFG"
+
+    # The console log and gameinfo.gi likewise.
+    rm "$GS/log/console/cs2server-console.log"
+    mkfifo "$GS/log/console/cs2server-console.log"
+    t0=$SECONDS
+    helper check
+    eq "exit status (fifo console)" 0 "$RC"
+    st_eq .before.matchzy null
+    [ $((SECONDS - t0)) -lt 10 ] || bad "a FIFO console log stalled the helper"
+    rm "$CSGO/gameinfo.gi"
+    mkfifo "$CSGO/gameinfo.gi"
+    t0=$SECONDS
+    helper game
+    eq "exit status (fifo gameinfo)" 1 "$RC"
+    [ $((SECONDS - t0)) -lt 10 ] || bad "a FIFO gameinfo.gi stalled the helper"
+
+    # An implausibly large config is an error, not something to truncate.
+    head -c 1100000 /dev/zero | tr '\0' 'x' >"$CFG"
+    helper repair-config
+    eq "exit status (huge config)" 1 "$RC"
+    eq "config left alone" 1100000 "$(stat -c %s "$CFG")"
+}
+
+test_symlinked_plugin_directories_are_refused_before_anything_changes() {
+    mv "$CSGO/addons" "$T/real-addons"
+    ln -s "$T/real-addons" "$CSGO/addons"
+    helper mods
+    eq "exit status" 1 "$RC"
+    st_eq .status failed
+    st_eq .failed_phase snapshot
+    has "$OUT" 'addons is a symbolic link - refusing'
+    eq "nothing was run" '' "$(calls)"
+    eq "nothing changed" 0.9.2 "$(cat "$T/real-addons/matchzy/VERSION")"
+    rm "$CSGO/addons"
+    mv "$T/real-addons" "$CSGO/addons"
+    mv "$CSGO/cfg/MatchZy" "$T/real-mz"
+    ln -s "$T/real-mz" "$CSGO/cfg/MatchZy"
+    helper all
+    st_eq .failed_phase snapshot
+    eq "only LinuxGSM itself was updated" 'update-lgsm,' "$(calls)"
+}
+
+# A check can be interrupted at once, not only when SteamCMD is done.
+test_sigterm_during_check_is_prompt() {
+    echo 30 >"$FAKE/slow_check"
+    helper_bg check
+    local pid=$! t0=$SECONDS
+    wait_for_phase check 'Remote build'
+    kill -TERM "$pid"
+    wait "$pid"
+    eq "exit status" 143 "$?"
+    [ $((SECONDS - t0)) -lt 8 ] || bad "check took $((SECONDS - t0))s to stop"
+    st_eq .status failed
+    eq "calls" 'check-update,' "$(calls)"
+    if pgrep -f "$GS/cs2server check-update" >/dev/null; then bad "check-update is still running"; fi
+}
+
+# A repair that changes nothing does not ask for the config to be re-read.
+test_needs_reload_only_when_the_config_changed() {
+    cp "$FAKE/mods_next/cfg/MatchZy/config.cfg" "$CFG"
+    helper repair-config
+    st_eq .config_changed true
+    st_eq .needs_reload true
+    helper repair-config
+    st_eq .config_changed false
+    st_eq .needs_reload false
+}
+
+# A demo block that lost its END, directly followed by the overrides block.
+test_half_demo_block_followed_by_the_overrides_block() {
+    echo 'matchzy_minimum_ready_required 5' >"$T/etc/matchzy_overrides.cfg"
+    printf '%s\n' 'matchzy_a 1' "$DEMO_BEGIN" \
+        'matchzy_demo_upload_url "https://old.example/"' \
+        'matchzy_demo_upload_header_value "Bearer OLD-STALE-TOKEN"' \
+        "$OVR_BEGIN" 'matchzy_minimum_ready_required "9"' 'matchzy_stale_override "1"' "$OVR_END" 'matchzy_b 2' >"$CFG"
+    helper repair-config
+    eq "exit status" 0 "$RC"
+    {
+        printf '%s\n' 'matchzy_a 1' 'matchzy_b 2' "$DEMO_BEGIN"
+        cat "$T/etc/matchzy_portal.cfg"
+        printf '%s\n' "$DEMO_END" "$OVR_BEGIN" 'matchzy_minimum_ready_required "5"' "$OVR_END"
+    } >"$T/expected.cfg"
+    cmp -s "$T/expected.cfg" "$CFG" || bad "config.cfg: $(diff "$T/expected.cfg" "$CFG" | grep -v 'Bearer' | head -8)"
+    cfg_eq .demo_upload_wired true
+    cfg_eq .overrides_applied true
+    hasnt "$RUN/state.json" OLD-STALE-TOKEN
 }
 
 # --- runner ------------------------------------------------------------------

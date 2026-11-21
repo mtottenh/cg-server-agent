@@ -39,7 +39,7 @@ inbound and never stores RCON credentials."""
 # jq/zstd/curl/util-linux (flock, runuser): the update helper. polkit: the
 # rule that lets the agent start the helper's unit (JS rules need polkit
 # >= 0.106, i.e. `polkitd`; 0.105's `policykit-1` installs but ignores them).
-depends = "$auto, ca-certificates, jq, zstd, curl, util-linux, polkitd | policykit-1"
+depends = "$auto, adduser, ca-certificates, jq, zstd, curl, util-linux, polkitd | policykit-1"
 section = "net"
 priority = "optional"
 assets = [

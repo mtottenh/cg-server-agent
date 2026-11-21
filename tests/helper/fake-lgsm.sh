@@ -13,6 +13,15 @@
 #   fake/slow_mods        `mods-update` copies its files, then takes this long
 #   fake/latin1           `mods-update` prints secrets after a non-UTF-8 byte
 #   fake/corrupt          `mods-update` truncates every file in this directory
+#   fake/lock_cfg         `mods-update` makes csgo/cfg read-only
+#   fake/slow_check       `check-update` takes this many seconds
+#   fake/update_rc        exit status of `update`
+#   fake/orphan           `update` leaves a detached process behind (as
+#                         SteamCMD under `runuser -l` would) and one that
+#                         looks like the tmux server, then hangs
+#
+# Like LinuxGSM: `start` on a running server does nothing, and `update`
+# stops the server only when there is an update.
 #                         (the helper's snapshots: a disk that lost them)
 #
 # Every call is appended to fake/calls.
@@ -58,14 +67,31 @@ case ${1:-} in
         printf '\033[32mChecking for update\033[0m\n'
         echo "* Local build: $(local_build)"
         echo "* Remote build: $(cat "$fake/remote_build")"
+        if [ -e "$fake/slow_check" ]; then
+            sleep "$(cat "$fake/slow_check")"
+        fi
         ;;
     update | force-update)
         echo 'Details: rcon_password "lgsm-rcon-secret"'
+        remote=$(cat "$fake/remote_build")
+        if [ -e "$fake/orphan" ]; then
+            # Own sessions: out of reach of `timeout` and of a group kill.
+            setsid sleep 37 &
+            setsid "$fake/tmux" 38 &
+            echo "SteamCMD downloading"
+            sleep 300
+        fi
         if [ -e "$fake/slow" ]; then
+            if [ "$(local_build)" != "$remote" ]; then
+                echo stopped >"$fake/running"
+            fi
             echo "SteamCMD downloading"
             sleep "$(cat "$fake/slow")"
         fi
-        remote=$(cat "$fake/remote_build")
+        if [ -e "$fake/update_rc" ]; then
+            echo "Error: SteamCMD failed"
+            exit "$(cat "$fake/update_rc")"
+        fi
         if [ "$(local_build)" != "$remote" ]; then
             sed -i -E "s/(\"buildid\"[[:space:]]+)\"[0-9]+\"/\1\"$remote\"/" "$manifest"
             if [ -e "$fake/strip_gameinfo" ]; then
@@ -92,6 +118,9 @@ case ${1:-} in
         if [ -d "$fake/mods_next" ]; then
             cp -Rf "$fake/mods_next/." "$csgo/"
         fi
+        if [ -e "$fake/lock_cfg" ]; then
+            chmod 0555 "$csgo/cfg"
+        fi
         if [ -e "$fake/corrupt" ]; then
             for f in "$(cat "$fake/corrupt")"/*; do : >"$f"; done
         fi
@@ -104,7 +133,15 @@ case ${1:-} in
     stop)
         echo stopped >"$fake/running"
         ;;
-    start | restart)
+    start)
+        if [ "$(cat "$fake/running" 2>/dev/null)" = running ]; then
+            echo "cs2server is already running"
+        else
+            echo running >"$fake/running"
+            boot
+        fi
+        ;;
+    restart)
         echo running >"$fake/running"
         boot
         ;;

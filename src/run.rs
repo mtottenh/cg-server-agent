@@ -17,13 +17,14 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::rcon;
-use crate::update::{self, Event, Updater};
+use crate::update::{self, Event, SentThisConnection, Updater};
 
-/// Makes a running server re-read the MatchZy config after the helper
-/// re-asserted the managed blocks but could not reach the console itself
-/// (`needs_reload`). Agent-internal: it never goes through `exec_refusal`,
-/// which keeps refusing `exec` from the portal.
+/// Makes a running server re-read the MatchZy config after `repair-config`
+/// changed the file under it (`needs_reload`). Agent-internal: it never goes
+/// through `exec_refusal`, which keeps refusing `exec` from the portal.
 const RELOAD_MATCHZY_CONFIG: &str = "exec MatchZy/config.cfg";
+/// How often a pending reload is retried (RCON down, match in progress).
+const RELOAD_RETRY: Duration = Duration::from_secs(10);
 
 pub struct RunConfig {
     pub portal_url: String,
@@ -49,16 +50,12 @@ pub async fn run(config: RunConfig) -> Result<()> {
     let updater = Arc::new(Updater::new(update::Paths::default()));
     // The watcher outlives every connection: update jobs run outside this
     // process and finish whether or not the portal is reachable.
-    let (rcon_addr, rcon_password) = (config.rcon_addr.clone(), config.rcon_password.clone());
-    let mut events = update::spawn_watcher(updater.clone(), move || {
-        let (addr, password) = (rcon_addr.clone(), rcon_password.clone());
-        tokio::spawn(async move {
-            match rcon::exec(&addr, &password, RELOAD_MATCHZY_CONFIG).await {
-                Ok(_) => tracing::info!("reloaded the MatchZy config over RCON"),
-                Err(e) => tracing::warn!(error = %e, "could not reload the MatchZy config"),
-            }
-        });
-    });
+    let mut events = update::spawn_watcher(updater.clone());
+    tokio::spawn(reload_when_idle(
+        updater.clone(),
+        config.rcon_addr.clone(),
+        config.rcon_password.clone(),
+    ));
 
     let mut backoff_secs = 1u64;
     loop {
@@ -82,6 +79,43 @@ pub async fn run(config: RunConfig) -> Result<()> {
     }
 }
 
+/// After a `repair-config` the file is right but the running server has not
+/// read it. Re-executing the MatchZy config resets settings a live match
+/// depends on, so it waits until MatchZy reports no match loaded; and it is
+/// retried for as long as RCON is unreachable. Independent of the portal
+/// connection: a repair the agent started on its own while offline still
+/// takes effect.
+async fn reload_when_idle(updater: Arc<Updater>, rcon_addr: String, rcon_password: String) {
+    let mut tick = tokio::time::interval(RELOAD_RETRY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        if !updater.reload_pending() {
+            continue;
+        }
+        let status = match rcon::exec(&rcon_addr, &rcon_password, "get5_status").await {
+            Ok(output) => extract_json(&output),
+            Err(e) => {
+                tracing::debug!(error = %e, "MatchZy config reload deferred: rcon unreachable");
+                continue;
+            }
+        };
+        if !update::reload_allowed(status.as_ref()) {
+            tracing::debug!(
+                "MatchZy config reload deferred: a match is loaded (or MatchZy did not answer)"
+            );
+            continue;
+        }
+        match rcon::exec(&rcon_addr, &rcon_password, RELOAD_MATCHZY_CONFIG).await {
+            Ok(_) => {
+                updater.reload_done();
+                tracing::info!("reloaded the MatchZy config over RCON");
+            }
+            Err(e) => tracing::warn!(error = %e, "could not reload the MatchZy config; will retry"),
+        }
+    }
+}
+
 /// Send one JSON frame; `false` means the connection is gone.
 async fn send_json<S>(sink: &mut S, frame: &serde_json::Value) -> bool
 where
@@ -92,39 +126,26 @@ where
         .is_ok()
 }
 
-/// Send an `update_result`; on success note that the portal has it, on
-/// failure keep it for the next connection.
-async fn send_result<S>(sink: &mut S, updater: &Updater, result: serde_json::Value) -> bool
-where
-    S: futures_util::Sink<Message> + Unpin,
-{
-    if send_json(sink, &update::result_frame(&result)).await {
-        updater.delivered(&result);
-        true
-    } else {
-        updater.stash_undelivered(result);
-        false
-    }
-}
-
 /// Forward one watcher event to the portal; `false` means the connection
-/// is gone.
-async fn deliver<S>(sink: &mut S, updater: &Updater, event: Event) -> bool
+/// is gone. A result that does not get through is not lost: the helper's own
+/// are replayed from its record, the agent's from the copy it keeps, on
+/// every connect until the portal acknowledges them (`update_ack`).
+async fn deliver<S>(
+    sink: &mut S,
+    updater: &Updater,
+    sent: &mut SentThisConnection,
+    event: Event,
+) -> bool
 where
     S: futures_util::Sink<Message> + Unpin,
 {
     match event {
         Event::Progress(frame) => send_json(sink, &frame).await,
         Event::CheckDone => send_json(sink, &updater.update_state_frame()).await,
+        // Once per connection: it may already have gone out in the replay
+        // on connect while the watcher's copy was still queued.
         Event::Result(result) => {
-            // Already replayed on connect: it ended while we were away and
-            // the watcher's copy was still queued.
-            let replayed = result.get("operation").and_then(|o| o.as_str()) != Some("check")
-                && result
-                    .get("job_id")
-                    .and_then(|j| j.as_str())
-                    .is_some_and(|job| updater.already_sent(job));
-            replayed || send_result(sink, updater, result).await
+            !sent.first_time(&result) || send_json(sink, &update::result_frame(&result)).await
         }
     }
 }
@@ -172,20 +193,17 @@ async fn connect_and_serve(
     // On every (re)connect: where updates stand, and any job that finished
     // while the channel was down. Old portals ignore frame types they do
     // not know.
-    if updater.capable() {
-        if !send_json(&mut sink, &updater.update_state_frame()).await {
-            return Ok(());
-        }
-        if let Some(result) = updater.unsent_result()
-            && !send_result(&mut sink, updater, result).await
-        {
-            return Ok(());
-        }
-    }
-    if let Some(result) = updater.take_undelivered()
-        && !send_result(&mut sink, updater, result).await
-    {
+    let mut sent = SentThisConnection::default();
+    if updater.capable() && !send_json(&mut sink, &updater.update_state_frame()).await {
         return Ok(());
+    }
+    // Everything the portal has not acknowledged (at most the last job and
+    // the last agent-made result), every time: a frame that was written to
+    // the socket is not a result the portal has stored.
+    for result in updater.unacked_results() {
+        if sent.first_time(&result) && !send_json(&mut sink, &update::result_frame(&result)).await {
+            return Ok(());
+        }
     }
     // Have the helper look at the MatchZy config now, so the heartbeats of
     // this connection report it from a fresh reading.
@@ -194,7 +212,9 @@ async fn connect_and_serve(
     // Whatever the watcher queued while we were disconnected: progress from
     // back then is stale (the job may be long over), the rest still counts.
     while let Ok(event) = events.try_recv() {
-        if !matches!(event, Event::Progress(_)) && !deliver(&mut sink, updater, event).await {
+        if !matches!(event, Event::Progress(_))
+            && !deliver(&mut sink, updater, &mut sent, event).await
+        {
             return Ok(());
         }
     }
@@ -202,7 +222,7 @@ async fn connect_and_serve(
     loop {
         tokio::select! {
             Some(event) = events.recv() => {
-                if !deliver(&mut sink, updater, event).await {
+                if !deliver(&mut sink, updater, &mut sent, event).await {
                     return Ok(());
                 }
             }
@@ -267,6 +287,7 @@ async fn heartbeat_frame(config: &RunConfig, updater: &Updater) -> serde_json::V
     frame["capabilities"] = json!(updater.capabilities());
     frame["demo_upload_wired"] = json!(health.demo_upload_wired);
     frame["overrides_applied"] = json!(health.overrides_applied);
+    frame["reload_pending"] = json!(updater.reload_pending());
     frame["update_job"] = json!(updater.running_job());
     frame
 }
@@ -411,6 +432,7 @@ async fn handle_frame(
         | "update_check"
         | "update_start"
         | "update_status"
+        | "update_ack"
         | "set_matchzy_overrides") => c,
         _ => "unknown",
     }
@@ -456,6 +478,17 @@ async fn execute_update_command(updater: &Updater, frame: &CommandFrame) -> Resu
             Ok(json!({ "started": true, "job_id": job_id, "operation": operation }).to_string())
         }
         "update_status" => Ok(json!(updater.read_state()).to_string()),
+        "update_ack" => {
+            // The portal has stored this job's result: stop replaying it.
+            let args = frame.args.as_ref().context("update_ack requires args")?;
+            let job_id = args["job_id"].as_str().context("missing job_id")?;
+            anyhow::ensure!(
+                update::valid_job_id(job_id),
+                "job_id must be a lowercase UUID"
+            );
+            updater.ack(job_id);
+            Ok(json!({ "acked": job_id }).to_string())
+        }
         "set_matchzy_overrides" => {
             let args = frame
                 .args
@@ -495,7 +528,7 @@ async fn execute_command(
 ) -> Result<String> {
     if matches!(
         frame.cmd.as_str(),
-        "update_check" | "update_start" | "update_status" | "set_matchzy_overrides"
+        "update_check" | "update_start" | "update_status" | "update_ack" | "set_matchzy_overrides"
     ) {
         return execute_update_command(updater, &frame).await;
     }

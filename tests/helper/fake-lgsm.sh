@@ -10,6 +10,10 @@
 #   fake/next_lgsm        version `update-lgsm` moves to
 #   fake/rotate           `start` begins a new console log (LinuxGSM does)
 #   fake/slow             `update` prints a line, then takes this many seconds
+#   fake/slow_mods        `mods-update` copies its files, then takes this long
+#   fake/latin1           `mods-update` prints secrets after a non-UTF-8 byte
+#   fake/corrupt          `mods-update` truncates every file in this directory
+#                         (the helper's snapshots: a disk that lost them)
 #
 # Every call is appended to fake/calls.
 # shellcheck disable=SC2034  # read by the helper, rewritten by update-lgsm
@@ -80,8 +84,20 @@ case ${1:-} in
     mods-update)
         # A chatty installer that echoes config lines, token included.
         grep -h 'matchzy_demo_upload' "$csgo/cfg/MatchZy/config.cfg"
+        if [ -e "$fake/latin1" ]; then
+            # A Latin-1 byte (a player name, a progress glyph) before the secret.
+            printf 'Installing MatchZy \xe9 : matchzy_demo_upload_header_value "Bearer latin1-token-secret"\n'
+            printf 'caf\xe9 \xff rcon_password "latin1-rcon-secret"\n'
+        fi
         if [ -d "$fake/mods_next" ]; then
             cp -Rf "$fake/mods_next/." "$csgo/"
+        fi
+        if [ -e "$fake/corrupt" ]; then
+            for f in "$(cat "$fake/corrupt")"/*; do : >"$f"; done
+        fi
+        if [ -e "$fake/slow_mods" ]; then
+            echo "extracting"
+            sleep "$(cat "$fake/slow_mods")"
         fi
         exit "$(cat "$fake/mods_rc" 2>/dev/null || echo 0)"
         ;;

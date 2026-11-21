@@ -129,17 +129,24 @@ jobs:
           # an unconfigured host opts out with 78 and writes no state
           rc=0; sudo /usr/sbin/portal-gs-update check || rc=$?
           test "$rc" -eq 78
-          ! test -e /run/portal-gs-update/state.json
+          # (`! cmd` does not fail a `bash -e` step unless it is the last
+          # command, hence the explicit ifs.)
+          if test -e /run/portal-gs-update/state.json; then exit 1; fi
           # so does the agent's capability: no gs-update.conf, no lgsm_update
-          ! sudo test -e /etc/portal/gs-update.conf
+          if sudo test -e /etc/portal/gs-update.conf; then exit 1; fi
+          # the maintainer script got its generated sections exactly once
+          # (a second debhelper token, even in a comment, doubles them), and
+          # the generated tmpfiles call names the file that is installed
+          test "$(grep -c 'deb-systemd-helper unmask' /var/lib/dpkg/info/portal-server-agent.postinst)" -eq 1
+          test "$(grep -c 'systemd-tmpfiles --create portal-gs-update.conf' /var/lib/dpkg/info/portal-server-agent.postinst)" -eq 1
 
       - name: Purge is clean
         run: |
           sudo dpkg --purge portal-server-agent
-          ! sudo test -e /etc/portal/portal-server-agent.env
-          ! getent passwd portal-agent
-          ! test -e /var/lib/portal-gs-update
-          ! test -e /usr/sbin/portal-gs-update
+          if sudo test -e /etc/portal/portal-server-agent.env; then exit 1; fi
+          if getent passwd portal-agent; then exit 1; fi
+          if test -e /var/lib/portal-gs-update; then exit 1; fi
+          if test -e /usr/sbin/portal-gs-update; then exit 1; fi
 
   # Attach to the GitHub release only after the smoke install passed.
   # softprops creates the release if the tag push is the first sighting.

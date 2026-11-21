@@ -1,8 +1,9 @@
 #!/bin/sh
 set -e
 
-# cargo-deb injects dh_installsystemd-style snippets below the #DEBHELPER#
-# marker for enabling the unit (start = false in Cargo.toml — the service
+# cargo-deb injects dh_installsystemd-style snippets at the debhelper marker
+# on the last line (the token must appear exactly ONCE in this file — every
+# occurrence is replaced, comments included) for enabling the unit (start = false in Cargo.toml — the service
 # is useless until `enroll` has run and the env file is filled in).
 # Everything above is our own setup: user, directories, conf file.
 

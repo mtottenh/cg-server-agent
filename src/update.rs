@@ -19,7 +19,9 @@
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -34,23 +36,32 @@ pub const OPERATIONS: [&str; 5] = ["lgsm", "game", "mods", "all", "repair-config
 const PROGRESS_DEBOUNCE: Duration = Duration::from_secs(1);
 /// How often the watcher looks at the state file.
 const WATCH_INTERVAL: Duration = Duration::from_millis(500);
-/// A started unit that has not written state after this long never ran
-/// (lock held by cron, unit failed, polkit said no).
-const PENDING_TIMEOUT: Duration = Duration::from_secs(60);
-/// A `running` state whose helper process is gone for this long is dead
-/// (SIGKILL, OOM). The grace covers the helper's own final write + exit.
+/// How long a started unit gets before the agent asks systemd whether it is
+/// still there. After that it is failed only once systemd says the unit is
+/// no longer active — a job waiting for the lock is not a failed job.
+const PENDING_GRACE: Duration = Duration::from_secs(10);
+/// A `running` state whose helper is gone for this long is dead (SIGKILL,
+/// OOM). The grace covers the helper's own final write + exit.
 const DEAD_HELPER_GRACE: Duration = Duration::from_secs(5);
-/// Auto-repair of the managed config blocks: at most once per this long.
+/// How often systemd is asked about a unit, and how long its answer is
+/// trusted.
+const UNIT_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+const UNIT_PROBE_MAX_AGE: Duration = Duration::from_secs(10);
+/// Auto-repair of the managed config blocks: at most once per this long,
+/// doubling after every repair that did not leave the config healthy.
 const AUTO_REPAIR_INTERVAL: Duration = Duration::from_secs(600);
+const AUTO_REPAIR_MAX_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 /// How often the agent asks the helper to re-check the MatchZy config.
 const VERIFY_INTERVAL: Duration = Duration::from_secs(300);
 /// A `config.json` older than this says nothing about the config now.
 const CONFIG_MAX_AGE: Duration = Duration::from_secs(900);
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(15);
+/// Job ids the portal has acknowledged, newest last.
+const ACKED_KEPT: usize = 8;
 
 const MAX_OVERRIDES: usize = 64;
-const MAX_OVERRIDE_VALUE_CHARS: usize = 256;
-const MAX_OVERRIDE_NAME_CHARS: usize = 128;
+const MAX_OVERRIDE_VALUE_BYTES: usize = 256;
+const MAX_OVERRIDE_NAME_BYTES: usize = 128;
 
 /// Every path and program this module touches. `Default` is production;
 /// tests point it at a temp directory and a fake `systemctl`.
@@ -67,8 +78,8 @@ pub struct Paths {
     /// Portal-managed MatchZy overrides, written here, read by the helper.
     pub overrides: PathBuf,
     pub systemctl: PathBuf,
-    /// Job id of the last finished job delivered to the portal.
-    pub sent_marker: PathBuf,
+    /// The agent's own: `acked-jobs`, `unacked-result.json`.
+    pub agent_state_dir: PathBuf,
     pub proc_dir: PathBuf,
 }
 
@@ -81,7 +92,7 @@ impl Default for Paths {
             state_dir: "/var/lib/portal-gs-update".into(),
             overrides: "/etc/portal/agent/matchzy_overrides.cfg".into(),
             systemctl: "systemctl".into(),
-            sent_marker: "/var/lib/portal-server-agent/last-sent-job".into(),
+            agent_state_dir: "/var/lib/portal-server-agent".into(),
             proc_dir: "/proc".into(),
         }
     }
@@ -97,32 +108,64 @@ struct Pending {
 
 /// What the helper last found in the MatchZy config file
 /// (`config.json`, written by `verify-config` and at the end of every job).
-/// Each is `None` when unknown: no report, a stale one, or nothing to
-/// compare against (no enrollment snippet / no overrides file).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The two findings are `None` when unknown: no report, a stale one, or
+/// nothing to compare against (no enrollment snippet / no overrides file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigHealth {
     /// The demo-upload block is in place and nothing after it overrides it.
     pub demo_upload_wired: Option<bool>,
     /// The portal's MatchZy overrides are in the config.
     pub overrides_applied: Option<bool>,
+    /// `AUTO_REPAIR` in gs-update.conf: may the agent repair on its own.
+    pub auto_repair: bool,
+}
+
+impl Default for ConfigHealth {
+    fn default() -> Self {
+        Self {
+            demo_upload_wired: None,
+            overrides_applied: None,
+            auto_repair: true,
+        }
+    }
 }
 
 impl ConfigHealth {
-    /// Something is definitely wrong that `repair-config` fixes.
+    /// Something is definitely wrong that `repair-config` is there to fix.
     pub fn needs_repair(&self) -> bool {
         self.demo_upload_wired == Some(false) || self.overrides_applied == Some(false)
     }
+
+    /// Known to be fine: at least one finding, none of them bad.
+    fn healthy(&self) -> bool {
+        !self.needs_repair()
+            && (self.demo_upload_wired.is_some() || self.overrides_applied.is_some())
+    }
+}
+
+#[derive(Default)]
+struct RepairState {
+    last: Option<Instant>,
+    /// Auto-repairs since the config was last seen healthy.
+    streak: u32,
 }
 
 pub struct Updater {
     paths: Paths,
     pending: Mutex<Option<Pending>>,
-    last_auto_repair: Mutex<Option<Instant>>,
+    repair: Mutex<RepairState>,
     last_verify: Mutex<Option<Instant>>,
-    /// In-memory copy of the sent marker (the file may be unwritable in dev).
-    last_sent: Mutex<Option<String>>,
-    /// A result that could not be sent and is recorded nowhere else.
-    undelivered: Mutex<Option<Value>>,
+    /// Job ids the portal acknowledged (`update_ack`), persisted.
+    acked: Mutex<Vec<String>>,
+    /// The latest result that exists nowhere on the helper's disk (a
+    /// failure the agent synthesized, a failed check) and is not yet
+    /// acknowledged. Persisted, so it is reported once, not once per agent
+    /// restart.
+    extra: Mutex<Option<Value>>,
+    /// The running server still has to re-read the MatchZy config.
+    reload_pending: AtomicBool,
+    /// (job id, unit active, when asked): systemd's word on the helper.
+    unit_probe: Mutex<Option<(String, bool, Instant)>>,
 }
 
 // --- small pure helpers ------------------------------------------------------
@@ -175,6 +218,17 @@ fn is_terminal(status: &str) -> bool {
     matches!(status, "succeeded" | "failed" | "rolled_back")
 }
 
+fn is_synthesized(result: &Value) -> bool {
+    result.get("agent_synthesized") == Some(&Value::Bool(true))
+}
+
+/// Is this result in the helper's `last-job.json`? Those are replayed from
+/// there; everything else (a failed check, a failure the agent made up)
+/// only exists in the agent.
+fn recorded_by_helper(result: &Value) -> bool {
+    str_field(result, "operation") != "check" && !is_synthesized(result)
+}
+
 fn read_json(path: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
@@ -203,6 +257,17 @@ fn write_atomic(path: &Path, contents: &str, mode: u32) -> Result<()> {
     result
 }
 
+/// May the MatchZy config be re-executed on the running server now? Only
+/// when MatchZy says no match is loaded: `exec MatchZy/config.cfg` resets
+/// settings a live match depends on. Anything else — a match in any state,
+/// no answer, an answer we cannot read — means "not now, ask again".
+pub fn reload_allowed(get5_status: Option<&Value>) -> bool {
+    get5_status
+        .and_then(|s| s.get("gamestate"))
+        .and_then(Value::as_str)
+        == Some("none")
+}
+
 // --- MatchZy overrides -------------------------------------------------------
 
 /// Why an override cvar name is not acceptable, if it is not.
@@ -211,12 +276,12 @@ fn override_name_refusal(name: &str) -> Option<&'static str> {
         Some(r) if !r.is_empty() => r,
         _ => return Some("name must match ^matchzy_[a-z0-9_]+$"),
     };
-    if name.len() > MAX_OVERRIDE_NAME_CHARS
+    if name.len() > MAX_OVERRIDE_NAME_BYTES
         || !rest
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
     {
-        return Some("name must match ^matchzy_[a-z0-9_]+$");
+        return Some("name must match ^matchzy_[a-z0-9_]+$ (at most 128 characters)");
     }
     // The portal owns these: demo upload and webhooks carry its tokens, the
     // load commands are the match lifecycle. Same list as `exec` refuses.
@@ -233,6 +298,13 @@ fn override_name_refusal(name: &str) -> Option<&'static str> {
 /// Validate `{cvar: value}` from the portal into `(cvar, value)` pairs,
 /// sorted by name. All-or-nothing: one bad entry rejects the whole set, so
 /// the file on disk is always exactly what the portal last sent.
+///
+/// Values are printable ASCII (0x20–0x7E) without `"`, `;` or `\`. Not
+/// "no control characters": U+2028, U+0085, NBSP and friends are not
+/// `char::is_control`, and what a console or a config parser makes of them
+/// is not something to find out in production. The helper applies the same
+/// rules, byte for byte, to the file (`render_overrides` in
+/// portal-gs-update); keep the two in step.
 pub fn validate_overrides(overrides: &Value) -> Result<Vec<(String, String)>> {
     let map = overrides
         .as_object()
@@ -244,23 +316,29 @@ pub fn validate_overrides(overrides: &Value) -> Result<Vec<(String, String)>> {
     for (name, value) in map {
         if let Some(reason) = override_name_refusal(name) {
             // Names are attacker-influenced: bound what we echo back.
-            let shown: String = name.chars().take(64).filter(|c| !c.is_control()).collect();
+            let shown: String = name
+                .chars()
+                .take(64)
+                .filter(|c| c.is_ascii_graphic())
+                .collect();
             bail!("override {shown:?} refused: {reason}");
         }
         let value = match value {
-            Value::String(s) => s.trim().to_string(),
+            Value::String(s) => s.trim_matches(' ').to_string(),
             Value::Number(n) => n.to_string(),
             Value::Bool(b) => b.to_string(),
             _ => bail!("override {name}: value must be a string, number or boolean"),
         };
-        if value.chars().count() > MAX_OVERRIDE_VALUE_CHARS {
-            bail!("override {name}: value longer than {MAX_OVERRIDE_VALUE_CHARS} characters");
+        if value.len() > MAX_OVERRIDE_VALUE_BYTES {
+            bail!("override {name}: value longer than {MAX_OVERRIDE_VALUE_BYTES} characters");
         }
-        if value
-            .chars()
-            .any(|c| c.is_control() || c == '"' || c == ';')
+        if !value
+            .bytes()
+            .all(|b| (0x20..=0x7e).contains(&b) && !matches!(b, b'"' | b';' | b'\\'))
         {
-            bail!("override {name}: value contains quotes, semicolons or control characters");
+            bail!(
+                "override {name}: value must be printable ASCII without quotes, semicolons or backslashes"
+            );
         }
         out.push((name.clone(), value));
     }
@@ -268,7 +346,7 @@ pub fn validate_overrides(overrides: &Value) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// The overrides file: one `cvar value` per line.
+/// The overrides file: one `cvar value` per line, one space between them.
 pub fn render_overrides(overrides: &[(String, String)]) -> String {
     overrides
         .iter()
@@ -309,6 +387,25 @@ pub fn result_frame(state: &Value) -> Value {
     frame
 }
 
+/// Which results have gone out on the current connection. A job that ended
+/// while the channel was down is replayed on connect *and* still sits in
+/// the watcher's queue; the portal should get it once per connection.
+#[derive(Default)]
+pub struct SentThisConnection(HashSet<String>);
+
+impl SentThisConnection {
+    /// `true` the first time a result is offered, `false` after that. A
+    /// synthesized failure and the real result that later replaces it are
+    /// two different results.
+    pub fn first_time(&mut self, result: &Value) -> bool {
+        self.0.insert(format!(
+            "{}:{}",
+            str_field(result, "job_id"),
+            is_synthesized(result)
+        ))
+    }
+}
+
 /// Turns successive readings of the state file into events: debounced
 /// progress while a job runs, exactly one result when it ends. Pure — the
 /// clock and the "is the helper alive" answer are passed in.
@@ -319,20 +416,31 @@ pub struct Tracker {
     last_progress_at: Option<Instant>,
     /// Job whose terminal state has been handled.
     done: Option<String>,
-    /// Job seen `running` with no helper process, and since when.
+    /// Job seen `running` with no helper, and since when.
     dead_since: Option<(String, Instant)>,
+    /// Job whose failure was made up here. Should the helper turn out to
+    /// have been alive after all, its real result still goes out.
+    synthesized: Option<String>,
 }
 
 impl Tracker {
-    /// Start from what is already on disk: a job that finished before this
-    /// process started is not news to the tracker. (Whether the *portal*
-    /// has it is the sent marker's business — see `Updater::unsent_result`.)
-    pub fn primed(state: Option<&Value>) -> Self {
+    /// Start from what is already on disk. A job that finished before this
+    /// process started is not news to the tracker (whether the *portal* has
+    /// it is `Updater::unacked_results`' business). Neither is a stale
+    /// `running` state whose failure an earlier agent process already
+    /// reported (`already_reported`): it must not be reported again after
+    /// every restart.
+    pub fn primed(state: Option<&Value>, already_reported: bool) -> Self {
         let mut tracker = Self::default();
-        if let Some(state) = state
-            && is_terminal(str_field(state, "status"))
-        {
-            tracker.done = Some(str_field(state, "job_id").to_string());
+        if let Some(state) = state {
+            let job = str_field(state, "job_id").to_string();
+            let status = str_field(state, "status");
+            if is_terminal(status) {
+                tracker.done = Some(job);
+            } else if status == "running" && already_reported {
+                tracker.done = Some(job.clone());
+                tracker.synthesized = Some(job);
+            }
         }
         tracker
     }
@@ -349,13 +457,22 @@ impl Tracker {
         let job_id = str_field(state, "job_id");
         let status = str_field(state, "status");
         let is_check = str_field(state, "operation") == "check";
-        if job_id.is_empty() || self.done.as_deref() == Some(job_id) {
+        if job_id.is_empty() {
+            return Vec::new();
+        }
+        if self.done.as_deref() == Some(job_id) {
+            // Declared dead, yet it finished: the truth supersedes our guess.
+            if is_terminal(status) && self.synthesized.as_deref() == Some(job_id) {
+                self.synthesized = None;
+                return vec![Event::Result(state.clone())];
+            }
             return Vec::new();
         }
 
         if is_terminal(status) {
             self.done = Some(job_id.to_string());
             self.dead_since = None;
+            self.synthesized = None;
             return if is_check && status == "succeeded" {
                 vec![Event::CheckDone]
             } else {
@@ -371,6 +488,7 @@ impl Tracker {
                 Some((id, since)) if id == job_id => {
                     if now.duration_since(*since) >= DEAD_HELPER_GRACE {
                         self.done = Some(job_id.to_string());
+                        self.synthesized = Some(job_id.to_string());
                         self.dead_since = None;
                         let mut dead = state.clone();
                         dead["status"] = json!("failed");
@@ -419,17 +537,25 @@ impl Tracker {
 
 impl Updater {
     pub fn new(paths: Paths) -> Self {
-        let last_sent = std::fs::read_to_string(&paths.sent_marker)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let acked = std::fs::read_to_string(paths.agent_state_dir.join("acked-jobs"))
+            .map(|s| {
+                s.lines()
+                    .map(str::trim)
+                    .filter(|l| valid_job_id(l))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let extra = read_json(&paths.agent_state_dir.join("unacked-result.json"));
         Self {
             paths,
             pending: Mutex::new(None),
-            last_auto_repair: Mutex::new(None),
+            repair: Mutex::new(RepairState::default()),
             last_verify: Mutex::new(None),
-            last_sent: Mutex::new(last_sent),
-            undelivered: Mutex::new(None),
+            acked: Mutex::new(acked),
+            extra: Mutex::new(extra),
+            reload_pending: AtomicBool::new(false),
+            unit_probe: Mutex::new(None),
         }
     }
 
@@ -450,9 +576,61 @@ impl Updater {
         read_json(&self.paths.run_dir.join("state.json"))
     }
 
-    /// Is the helper that wrote this state still running? Its pid is in the
-    /// state; the command line guards against a recycled pid.
+    // --- is the helper alive -------------------------------------------------
+
+    /// Ask systemd whether an operation's unit instance is (still) running.
+    /// Needs no privilege. `false` on any error: the caller's fallback is
+    /// `/proc`.
+    pub async fn unit_active(&self, operation: &str) -> bool {
+        let mut command = tokio::process::Command::new(&self.paths.systemctl);
+        command
+            .args(["is-active", &unit_name(operation)])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        match tokio::time::timeout(SYSTEMCTL_TIMEOUT, command.output()).await {
+            Ok(Ok(output)) => matches!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                "active" | "activating" | "deactivating" | "reloading"
+            ),
+            _ => false,
+        }
+    }
+
+    /// Keep systemd's answer about the job in `state` fresh. Called by the
+    /// watcher; everything else reads the cached answer.
+    pub async fn refresh_liveness(&self, state: &Value) {
+        if str_field(state, "status") != "running" {
+            return;
+        }
+        let job = str_field(state, "job_id");
+        {
+            let probe = self.unit_probe.lock().unwrap();
+            if let Some((id, _, at)) = probe.as_ref()
+                && id == job
+                && at.elapsed() < UNIT_PROBE_INTERVAL
+            {
+                return;
+            }
+        }
+        let active = self.unit_active(str_field(state, "operation")).await;
+        *self.unit_probe.lock().unwrap() = Some((job.to_string(), active, Instant::now()));
+    }
+
+    /// Is the helper that wrote this state still running? First systemd's
+    /// word on the unit (works with `hidepid`, cannot be fooled by a
+    /// recycled pid); then, for a job run from cron or by hand — which is
+    /// not the unit — its pid in `/proc`, checked against the command line.
     pub fn helper_alive(&self, state: &Value) -> bool {
+        {
+            let probe = self.unit_probe.lock().unwrap();
+            if let Some((id, active, at)) = probe.as_ref()
+                && id == str_field(state, "job_id")
+                && *active
+                && at.elapsed() < UNIT_PROBE_MAX_AGE
+            {
+                return true;
+            }
+        }
         let Some(pid) = state.get("pid").and_then(Value::as_u64) else {
             return false;
         };
@@ -490,6 +668,8 @@ impl Updater {
             })
         })
     }
+
+    // --- starting jobs -------------------------------------------------------
 
     /// Start one helper operation. Returns as soon as systemd has accepted
     /// the start; the job itself is followed by the watcher.
@@ -568,17 +748,47 @@ impl Updater {
         Ok(())
     }
 
-    /// Give up on a unit we started that never published state: clears the
-    /// claim and returns the failure to report. Also clears the claim (no
-    /// failure) once the helper has picked the job up.
-    pub fn settle_pending(&self, state: Option<&Value>, now: Instant) -> Option<Value> {
+    /// The operation of a unit we started that has had its grace period and
+    /// still shows no state: time to ask systemd about it.
+    pub fn pending_overdue(&self, now: Instant) -> Option<String> {
+        let pending = self.pending.lock().unwrap();
+        pending
+            .as_ref()
+            .filter(|p| now.duration_since(p.since) >= PENDING_GRACE)
+            .map(|p| p.operation.clone())
+    }
+
+    /// Resolve a unit we started. `unit_active` is systemd's answer for it
+    /// (`true` when not asked). Returns a result to report, if there is one:
+    ///
+    /// * the helper published state for the job → nothing, the watcher has it;
+    /// * the helper finished but could not publish (run directory full): its
+    ///   own record from `last-job.json`;
+    /// * the grace period is over and the unit is gone without a trace (it
+    ///   never got the lock, the request was refused, the unit failed): a
+    ///   synthesized failure;
+    /// * otherwise — still within the grace period, or the unit is still
+    ///   active, e.g. waiting for the lock — keep waiting.
+    pub fn settle_pending(
+        &self,
+        state: Option<&Value>,
+        now: Instant,
+        unit_active: bool,
+    ) -> Option<Value> {
         let mut pending = self.pending.lock().unwrap();
         let p = pending.as_ref()?;
         if state.is_some_and(|s| str_field(s, "job_id") == p.job_id) {
             *pending = None;
             return None;
         }
-        if now.duration_since(p.since) < PENDING_TIMEOUT {
+        if let Some(last) = read_json(&self.paths.state_dir.join("last-job.json"))
+            && str_field(&last, "job_id") == p.job_id
+            && is_terminal(str_field(&last, "status"))
+        {
+            *pending = None;
+            return Some(last);
+        }
+        if now.duration_since(p.since) < PENDING_GRACE || unit_active {
             return None;
         }
         let failure = json!({
@@ -589,8 +799,7 @@ impl Updater {
             "failed_phase": "starting",
             "agent_synthesized": true,
             "error": format!(
-                "the update helper did not start within {}s (another operation holds the lock, or the unit failed — see `journalctl -u '{}'`)",
-                PENDING_TIMEOUT.as_secs(),
+                "the update helper ended without reporting anything (it could not get the lock, or the unit failed — see `journalctl -u '{}'`)",
                 unit_name(&p.operation)
             ),
         });
@@ -599,6 +808,8 @@ impl Updater {
         let _ = std::fs::remove_file(self.paths.run_dir.join("request.json"));
         Some(failure)
     }
+
+    // --- overrides and reports -----------------------------------------------
 
     /// Validate and persist the portal's MatchZy overrides. Returns how many
     /// were written. The helper applies them on its next config reconcile.
@@ -618,58 +829,97 @@ impl Updater {
         })
     }
 
-    pub fn already_sent(&self, job_id: &str) -> bool {
-        self.last_sent.lock().unwrap().as_deref() == Some(job_id)
+    // --- delivery: at least once, until acknowledged -------------------------
+
+    pub fn is_acked(&self, job_id: &str) -> bool {
+        self.acked.lock().unwrap().iter().any(|j| j == job_id)
     }
 
-    /// An `update_result` reached the portal. Results the helper recorded
-    /// (they are in `last-job.json`) move the sent marker; a check's failure
-    /// or a failure the agent synthesized has no such record and must not,
-    /// or the previous real job would look unsent again.
-    pub fn delivered(&self, result: &Value) {
-        if str_field(result, "operation") != "check"
-            && result.get("agent_synthesized") != Some(&Value::Bool(true))
+    fn persist(&self, name: &str, contents: &str) {
+        let _ = std::fs::create_dir_all(&self.paths.agent_state_dir);
+        if let Err(e) = write_atomic(&self.paths.agent_state_dir.join(name), contents, 0o644) {
+            tracing::debug!(error = %e, file = name, "could not persist agent state");
+        }
+    }
+
+    /// The portal has this job's result (`update_ack`). Sending a frame is
+    /// not the same as the portal having stored it, so only this stops the
+    /// replay on reconnect. Persisted, so it also holds across restarts.
+    pub fn ack(&self, job_id: &str) {
         {
-            self.mark_sent(str_field(result, "job_id"));
+            let mut acked = self.acked.lock().unwrap();
+            acked.retain(|j| j != job_id);
+            acked.push(job_id.to_string());
+            let excess = acked.len().saturating_sub(ACKED_KEPT);
+            acked.drain(..excess);
+            self.persist("acked-jobs", &(acked.join("\n") + "\n"));
         }
-    }
-
-    /// Keep a result whose send failed so the next connection delivers it.
-    /// Only needed for results that exist nowhere on disk; the helper's own
-    /// are replayed from `last-job.json` by `unsent_result`.
-    pub fn stash_undelivered(&self, result: Value) {
-        *self.undelivered.lock().unwrap() = Some(result);
-    }
-
-    pub fn take_undelivered(&self) -> Option<Value> {
-        self.undelivered.lock().unwrap().take()
-    }
-
-    /// Record that the portal has this job's result. Persisted so a job that
-    /// was delivered is not replayed after an agent restart.
-    pub fn mark_sent(&self, job_id: &str) {
-        *self.last_sent.lock().unwrap() = Some(job_id.to_string());
-        if let Some(dir) = self.paths.sent_marker.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Err(e) = write_atomic(&self.paths.sent_marker, &format!("{job_id}\n"), 0o644) {
-            tracing::debug!(error = %e, "could not persist the sent marker");
-        }
-    }
-
-    /// The last finished job, if the portal has not been sent it: a job
-    /// that ended while the channel was down, or while the agent was.
-    pub fn unsent_result(&self) -> Option<Value> {
-        let last = read_json(&self.paths.state_dir.join("last-job.json"))?;
-        let job_id = str_field(&last, "job_id");
-        if job_id.is_empty()
-            || !is_terminal(str_field(&last, "status"))
-            || self.already_sent(job_id)
+        let mut extra = self.extra.lock().unwrap();
+        if extra
+            .as_ref()
+            .is_some_and(|r| str_field(r, "job_id") == job_id)
         {
-            return None;
+            *extra = None;
+            let _ = std::fs::remove_file(self.paths.agent_state_dir.join("unacked-result.json"));
         }
-        Some(last)
     }
+
+    /// Remember a result that exists nowhere on the helper's disk until the
+    /// portal acknowledges it. One slot: the most recent.
+    pub fn keep_extra(&self, result: &Value) {
+        *self.extra.lock().unwrap() = Some(result.clone());
+        self.persist("unacked-result.json", &result.to_string());
+    }
+
+    /// The helper's real result arrived for a job whose failure we had made
+    /// up: the guess is no longer owed to anyone.
+    fn drop_extra_for(&self, job_id: &str) {
+        let mut extra = self.extra.lock().unwrap();
+        if extra
+            .as_ref()
+            .is_some_and(|r| str_field(r, "job_id") == job_id)
+        {
+            *extra = None;
+            let _ = std::fs::remove_file(self.paths.agent_state_dir.join("unacked-result.json"));
+        }
+    }
+
+    /// Has a failure for this job already been synthesized (and kept, or
+    /// even acknowledged) by an earlier agent process?
+    fn already_reported(&self, job_id: &str) -> bool {
+        self.is_acked(job_id)
+            || self
+                .extra
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|r| str_field(r, "job_id") == job_id)
+    }
+
+    /// Results the portal has not acknowledged, to (re)send on connect: the
+    /// last finished job from the helper's record, and the latest result
+    /// that only the agent has. Bounded to those two — never a backlog.
+    pub fn unacked_results(&self) -> Vec<Value> {
+        let mut out = Vec::new();
+        if let Some(last) = read_json(&self.paths.state_dir.join("last-job.json")) {
+            let job_id = str_field(&last, "job_id");
+            if !job_id.is_empty()
+                && is_terminal(str_field(&last, "status"))
+                && !self.is_acked(job_id)
+            {
+                out.push(last);
+            }
+        }
+        if let Some(extra) = self.extra.lock().unwrap().clone() {
+            let job_id = str_field(&extra, "job_id");
+            if !self.is_acked(job_id) && out.iter().all(|r| str_field(r, "job_id") != job_id) {
+                out.push(extra);
+            }
+        }
+        out
+    }
+
+    // --- config health, verify, auto-repair, reload --------------------------
 
     /// The helper's last word on the MatchZy config. The running server
     /// cannot be asked instead: MatchZy's settings are console commands, not
@@ -688,6 +938,8 @@ impl Updater {
         ConfigHealth {
             demo_upload_wired: report.get("demo_upload_wired").and_then(Value::as_bool),
             overrides_applied: report.get("overrides_applied").and_then(Value::as_bool),
+            // Only an explicit `false` switches it off.
+            auto_repair: report.get("auto_repair") != Some(&Value::Bool(false)),
         }
     }
 
@@ -717,32 +969,83 @@ impl Updater {
 
     /// Should the agent run `repair-config` on its own right now? Only when
     /// the helper found a managed block definitely missing or overridden,
-    /// only when idle, at most once per `AUTO_REPAIR_INTERVAL`. Claims the
-    /// slot when it says yes.
+    /// the operator has not switched it off (`AUTO_REPAIR=false`), and
+    /// nothing is running. Rate-limited: 10 minutes after the first repair,
+    /// doubling (to 6 hours at most) after each one that did not leave the
+    /// config healthy — a repair that cannot work (a rejected overrides
+    /// file, a config the game user cannot write) must not rewrite files and
+    /// poke the server every 10 minutes forever. A healthy reading resets
+    /// it. Claims the slot when it says yes.
     pub fn claim_auto_repair(&self, health: ConfigHealth, now: Instant) -> bool {
-        if !health.needs_repair() || !self.capable() || self.running_job().is_some() {
+        let mut repair = self.repair.lock().unwrap();
+        if health.healthy() {
+            repair.streak = 0;
+        }
+        if !health.needs_repair()
+            || !health.auto_repair
+            || !self.capable()
+            || self.running_job().is_some()
+        {
             return false;
         }
-        let mut last = self.last_auto_repair.lock().unwrap();
-        if last.is_some_and(|at| now.duration_since(at) < AUTO_REPAIR_INTERVAL) {
+        let interval = AUTO_REPAIR_INTERVAL
+            .saturating_mul(1u32 << repair.streak.saturating_sub(1).min(16))
+            .min(AUTO_REPAIR_MAX_INTERVAL);
+        if repair
+            .last
+            .is_some_and(|at| now.duration_since(at) < interval)
+        {
             return false;
         }
-        *last = Some(now);
+        repair.last = Some(now);
+        repair.streak = repair.streak.saturating_add(1);
         true
+    }
+
+    /// The running server has to re-read the MatchZy config (a
+    /// `repair-config` changed the file under it). Stays set until
+    /// `reload_done`: across RCON outages, and for as long as a match is
+    /// loaded.
+    pub fn request_reload(&self) {
+        self.reload_pending.store(true, Ordering::SeqCst);
+    }
+
+    pub fn reload_pending(&self) -> bool {
+        self.reload_pending.load(Ordering::SeqCst)
+    }
+
+    pub fn reload_done(&self) {
+        self.reload_pending.store(false, Ordering::SeqCst);
+    }
+
+    /// Everything that follows from a result leaving the watcher, before it
+    /// is queued for the portal.
+    fn note_result(&self, result: &Value) {
+        if result.get("needs_reload") == Some(&Value::Bool(true))
+            && str_field(result, "status") == "succeeded"
+        {
+            self.request_reload();
+        }
+        if recorded_by_helper(result) {
+            self.drop_extra_for(str_field(result, "job_id"));
+        } else {
+            self.keep_extra(result);
+        }
     }
 }
 
 /// Watch the state file for the life of the process and feed events to the
 /// connection loop. Runs in its own task: the loop must never wait on the
-/// helper. `reload` is called when a finished repair left the running
-/// server still to be told (`needs_reload`).
-pub fn spawn_watcher<F>(updater: Arc<Updater>, reload: F) -> mpsc::Receiver<Event>
-where
-    F: Fn() + Send + 'static,
-{
+/// helper.
+pub fn spawn_watcher(updater: Arc<Updater>) -> mpsc::Receiver<Event> {
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {
-        let mut tracker = Tracker::primed(updater.read_state().as_ref());
+        let initial = updater.read_state();
+        let reported = initial
+            .as_ref()
+            .is_some_and(|s| updater.already_reported(str_field(s, "job_id")));
+        let mut tracker = Tracker::primed(initial.as_ref(), reported);
+        let mut last_pending_probe: Option<Instant> = None;
         let mut tick = tokio::time::interval(WATCH_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -750,11 +1053,25 @@ where
             let state = updater.read_state();
             let now = Instant::now();
             let mut events = Vec::new();
-            if let Some(failure) = updater.settle_pending(state.as_ref(), now) {
-                events.push(Event::Result(failure));
+
+            // A unit we started that shows no state: ask systemd, not a timer.
+            let mut unit_active = true;
+            if let Some(operation) = updater.pending_overdue(now)
+                && last_pending_probe.is_none_or(|at| now.duration_since(at) >= UNIT_PROBE_INTERVAL)
+            {
+                last_pending_probe = Some(now);
+                unit_active = updater.unit_active(&operation).await;
+            }
+            if let Some(result) = updater.settle_pending(state.as_ref(), now, unit_active) {
+                events.push(Event::Result(result));
+            }
+
+            if let Some(state) = &state {
+                updater.refresh_liveness(state).await;
             }
             let alive = state.as_ref().is_some_and(|s| updater.helper_alive(s));
             events.extend(tracker.observe(state.as_ref(), alive, now));
+
             for event in events {
                 match event {
                     // Progress is disposable: with the channel full (portal
@@ -763,9 +1080,7 @@ where
                         let _ = tx.try_send(event);
                     }
                     Event::Result(ref result) => {
-                        if result.get("needs_reload") == Some(&Value::Bool(true)) {
-                            reload();
-                        }
+                        updater.note_result(result);
                         if tx.send(event).await.is_err() {
                             return;
                         }
@@ -786,11 +1101,27 @@ where
 mod tests {
     use super::*;
 
-    /// A fresh directory tree standing in for the host; removed on drop.
+    /// A fresh directory tree standing in for the host, with a fake
+    /// `systemctl`; removed on drop.
     struct Host {
         root: PathBuf,
         paths: Paths,
     }
+
+    /// `is-active` prints bin/unit-state (default `inactive`); anything else
+    /// exits with bin/start-rc (default 0). Every call is logged.
+    const FAKE_SYSTEMCTL: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+echo "$*" >>"$d/calls"
+case "$1" in
+    is-active)
+        s=$(cat "$d/unit-state" 2>/dev/null || echo inactive)
+        echo "$s"
+        [ "$s" = active ]
+        ;;
+    *) exit "$(cat "$d/start-rc" 2>/dev/null || echo 0)" ;;
+esac
+"#;
 
     impl Host {
         fn new() -> Self {
@@ -799,17 +1130,37 @@ mod tests {
                 std::process::id(),
                 rand::random::<u64>()
             ));
-            for dir in ["etc/agent", "run", "state", "agent-state", "proc", "sbin"] {
+            for dir in [
+                "etc/agent",
+                "run",
+                "state",
+                "agent-state",
+                "proc",
+                "sbin",
+                "bin",
+            ] {
                 std::fs::create_dir_all(root.join(dir)).unwrap();
             }
+            let systemctl = root.join("bin/systemctl");
+            // Written by a child process, never by this one: a file this
+            // process holds open for writing can be inherited by another
+            // test's fork and then fails to exec with ETXTBSY.
+            let ok = std::process::Command::new("sh")
+                .args(["-c", r#"printf '%s' "$2" >"$1" && chmod 755 "$1""#, "sh"])
+                .arg(&systemctl)
+                .arg(FAKE_SYSTEMCTL)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "could not install the fake systemctl");
             let paths = Paths {
                 conf: root.join("etc/gs-update.conf"),
                 helper: root.join("sbin/portal-gs-update"),
                 run_dir: root.join("run"),
                 state_dir: root.join("state"),
                 overrides: root.join("etc/agent/matchzy_overrides.cfg"),
-                systemctl: "true".into(),
-                sent_marker: root.join("agent-state/last-sent-job"),
+                systemctl,
+                agent_state_dir: root.join("agent-state"),
                 proc_dir: root.join("proc"),
             };
             Self { root, paths }
@@ -828,6 +1179,32 @@ mod tests {
 
         fn write_state(&self, state: &Value) {
             std::fs::write(self.paths.run_dir.join("state.json"), state.to_string()).unwrap();
+        }
+
+        fn write_last_job(&self, state: &Value) {
+            std::fs::write(
+                self.paths.state_dir.join("last-job.json"),
+                state.to_string(),
+            )
+            .unwrap();
+        }
+
+        /// What `systemctl is-active` answers.
+        fn unit_state(&self, state: &str) {
+            std::fs::write(self.root.join("bin/unit-state"), state).unwrap();
+        }
+
+        /// Make `systemctl start` fail.
+        fn start_fails(&self) {
+            std::fs::write(self.root.join("bin/start-rc"), "1").unwrap();
+        }
+
+        fn systemctl_calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.root.join("bin/calls"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
         }
 
         /// Pretend pid `pid` is a live helper process.
@@ -850,12 +1227,17 @@ mod tests {
 
     const JOB: &str = "0b0e3c5e-7f0a-4c1d-9b7e-1a2b3c4d5e6f";
     const JOB2: &str = "11111111-2222-4333-8444-555555555555";
+    const JOB3: &str = "99999999-8888-4777-8666-555555555555";
 
     fn state(job: &str, operation: &str, status: &str, phase: &str, log: &str) -> Value {
         json!({
             "job_id": job, "operation": operation, "trigger": "portal", "pid": 4242,
             "status": status, "phase": phase, "log_tail": log, "needs_reload": false,
         })
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
     }
 
     // --- overrides -----------------------------------------------------------
@@ -889,6 +1271,13 @@ mod tests {
             "matchzy_knife_enabled_default \nmatchzy_minimum_ready_required 5\n"
         );
         assert_eq!(validate_overrides(&json!({})).unwrap(), vec![]);
+        // Everything printable that is not a quote, semicolon or backslash.
+        let all: String = (0x20u8..=0x7e)
+            .map(char::from)
+            .filter(|c| !matches!(c, '"' | ';' | '\\'))
+            .collect();
+        let v = validate_overrides(&json!({ "matchzy_x": format!("a{all}z") })).unwrap();
+        assert_eq!(v[0].1, format!("a{all}z"));
     }
 
     #[test]
@@ -914,10 +1303,12 @@ mod tests {
             "sv_cheats",
             "matchzy_",
             "MATCHZY_x",
+            "matchzy_X",
             "matchzy_x y",
             "matchzy_x;quit",
             "matchzy_x\nrcon_password",
             "matchzy_é",
+            "matchzy_x\u{2028}",
             " matchzy_x",
         ] {
             assert!(
@@ -925,13 +1316,36 @@ mod tests {
                 "{name:?}"
             );
         }
-        let long = format!("matchzy_{}", "a".repeat(200));
+        let ok = format!("matchzy_{}", "a".repeat(120));
+        assert_eq!(ok.len(), 128);
+        assert!(validate_overrides(&json!({ ok: "1" })).is_ok());
+        let long = format!("matchzy_{}", "a".repeat(121));
         assert!(validate_overrides(&json!({ long: "1" })).is_err());
     }
 
     #[test]
-    fn overrides_refuse_values_that_could_escape_the_line() {
-        for value in ["a\"b", "a;b", "a\nb", "a\rb", "a\tb", "a\u{0}b", "\u{7f}"] {
+    fn overrides_refuse_anything_but_printable_ascii_in_values() {
+        for value in [
+            "a\"b",
+            "a;b",
+            "a\\",
+            "a\nb",
+            "a\rb",
+            "a\tb",
+            "a\u{0}b",
+            "\u{7f}",
+            // Not `char::is_control`, and exactly why the rule is an
+            // allow-list: line and paragraph separators, NEL, NBSP,
+            // zero-width and bidi format characters, plain non-ASCII.
+            "1\u{2028}quit",
+            "1\u{2029}quit",
+            "1\u{85}quit",
+            "1\u{a0}quit",
+            "1\u{200b}quit",
+            "1\u{202e}quit",
+            "1\u{feff}quit",
+            "café",
+        ] {
             assert!(
                 validate_overrides(&json!({ "matchzy_chat_prefix": value })).is_err(),
                 "{value:?}"
@@ -1022,13 +1436,10 @@ mod tests {
         let mut t = Tracker::default();
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let s = |phase: &str, log: &str| state(JOB, "mods", "running", phase, log);
 
         // First sight of a job: immediately.
-        let e = t.observe(
-            Some(&state(JOB, "mods", "running", "snapshot", "a")),
-            true,
-            at(0),
-        );
+        let e = t.observe(Some(&s("snapshot", "a")), true, at(0));
         assert_eq!(progress_phases(&e), ["snapshot"]);
         assert_eq!(
             e[0],
@@ -1039,63 +1450,28 @@ mod tests {
         );
         // Unchanged: nothing, however long we wait.
         assert!(
-            t.observe(
-                Some(&state(JOB, "mods", "running", "snapshot", "a")),
-                true,
-                at(5000)
-            )
-            .is_empty()
+            t.observe(Some(&s("snapshot", "a")), true, at(5000))
+                .is_empty()
         );
+        let e = t.observe(Some(&s("stop", "ab")), true, at(5100));
+        assert_eq!(progress_phases(&e), ["stop"], "5s since the last frame");
         // Changes inside the window are held…
-        let e = t.observe(
-            Some(&state(JOB, "mods", "running", "stop", "ab")),
-            true,
-            at(5100),
-        );
-        assert_eq!(
-            progress_phases(&e),
-            ["stop"],
-            "5s since the last frame: due"
+        assert!(
+            t.observe(Some(&s("mods-update", "abc")), true, at(5400))
+                .is_empty()
         );
         assert!(
-            t.observe(
-                Some(&state(JOB, "mods", "running", "mods-update", "abc")),
-                true,
-                at(5400)
-            )
-            .is_empty()
-        );
-        assert!(
-            t.observe(
-                Some(&state(JOB, "mods", "running", "mods-update", "abcd")),
-                true,
-                at(5900)
-            )
-            .is_empty()
+            t.observe(Some(&s("mods-update", "abcd")), true, at(5900))
+                .is_empty()
         );
         // …and the latest reading goes out once the second is up.
-        let e = t.observe(
-            Some(&state(JOB, "mods", "running", "mods-update", "abcd")),
-            true,
-            at(6100),
-        );
-        assert_eq!(progress_phases(&e), ["mods-update"]);
+        let e = t.observe(Some(&s("mods-update", "abcd")), true, at(6100));
         assert_eq!(
-            e[0],
-            Event::Progress(progress_frame(&state(
-                JOB,
-                "mods",
-                "running",
-                "mods-update",
-                "abcd"
-            )))
+            e,
+            vec![Event::Progress(progress_frame(&s("mods-update", "abcd")))]
         );
         // A log-only change counts as a change.
-        let e = t.observe(
-            Some(&state(JOB, "mods", "running", "mods-update", "abcde")),
-            true,
-            at(7200),
-        );
+        let e = t.observe(Some(&s("mods-update", "abcde")), true, at(7200));
         assert_eq!(e.len(), 1);
     }
 
@@ -1113,10 +1489,7 @@ mod tests {
         let e = t.observe(Some(&done), false, now);
         assert_eq!(e, vec![Event::Result(done.clone())]);
         for _ in 0..3 {
-            assert!(
-                t.observe(Some(&done), false, now + Duration::from_secs(60))
-                    .is_empty()
-            );
+            assert!(t.observe(Some(&done), false, now + secs(60)).is_empty());
         }
         let frame = result_frame(&done);
         assert_eq!(frame["type"], "update_result");
@@ -1141,14 +1514,14 @@ mod tests {
     #[test]
     fn a_job_that_ended_before_the_agent_started_is_not_re_emitted() {
         let done = state(JOB, "mods", "succeeded", "done", "");
-        let mut t = Tracker::primed(Some(&done));
+        let mut t = Tracker::primed(Some(&done), false);
         assert!(t.observe(Some(&done), false, Instant::now()).is_empty());
         // But one still running when the agent starts is picked up.
         let running = state(JOB2, "mods", "running", "start", "");
-        let mut t = Tracker::primed(Some(&running));
+        let mut t = Tracker::primed(Some(&running), false);
         assert_eq!(t.observe(Some(&running), true, Instant::now()).len(), 1);
         assert!(
-            Tracker::primed(None)
+            Tracker::primed(None, false)
                 .observe(None, false, Instant::now())
                 .is_empty()
         );
@@ -1158,28 +1531,11 @@ mod tests {
     fn a_check_reports_through_update_state_not_progress() {
         let mut t = Tracker::default();
         let now = Instant::now();
-        assert!(
-            t.observe(
-                Some(&state(JOB, "check", "running", "check", "x")),
-                true,
-                now
-            )
-            .is_empty()
-        );
-        let e = t.observe(
-            Some(&state(JOB, "check", "succeeded", "done", "x")),
-            false,
-            now,
-        );
-        assert_eq!(e, vec![Event::CheckDone]);
-        assert!(
-            t.observe(
-                Some(&state(JOB, "check", "succeeded", "done", "x")),
-                false,
-                now
-            )
-            .is_empty()
-        );
+        let running = state(JOB, "check", "running", "check", "x");
+        assert!(t.observe(Some(&running), true, now).is_empty());
+        let done = state(JOB, "check", "succeeded", "done", "x");
+        assert_eq!(t.observe(Some(&done), false, now), vec![Event::CheckDone]);
+        assert!(t.observe(Some(&done), false, now).is_empty());
         // A check that failed has an error worth showing.
         let failed = state(JOB2, "check", "failed", "check", "x");
         assert_eq!(
@@ -1195,15 +1551,9 @@ mod tests {
         let running = state(JOB, "mods", "running", "mods-update", "tail");
         t.observe(Some(&running), true, t0);
         // Helper gone, but it may just have written its last state.
-        assert!(
-            t.observe(Some(&running), false, t0 + Duration::from_secs(1))
-                .is_empty()
-        );
-        assert!(
-            t.observe(Some(&running), false, t0 + Duration::from_secs(4))
-                .is_empty()
-        );
-        let e = t.observe(Some(&running), false, t0 + Duration::from_secs(7));
+        assert!(t.observe(Some(&running), false, t0 + secs(1)).is_empty());
+        assert!(t.observe(Some(&running), false, t0 + secs(4)).is_empty());
+        let e = t.observe(Some(&running), false, t0 + secs(7));
         let [Event::Result(dead)] = e.as_slice() else {
             panic!("expected one result, got {e:?}");
         };
@@ -1217,75 +1567,237 @@ mod tests {
                 .unwrap()
                 .contains("without recording a result")
         );
-        assert!(
-            t.observe(Some(&running), false, t0 + Duration::from_secs(60))
-                .is_empty()
+        assert!(t.observe(Some(&running), false, t0 + secs(60)).is_empty());
+
+        // The guess was wrong (liveness could not be seen, e.g. hidepid and a
+        // job run by hand): when the helper does finish, the real result
+        // still goes out — once.
+        let done = state(JOB, "mods", "succeeded", "done", "");
+        assert_eq!(
+            t.observe(Some(&done), false, t0 + secs(90)),
+            vec![Event::Result(done.clone())]
         );
+        assert!(t.observe(Some(&done), false, t0 + secs(91)).is_empty());
 
         // The usual race — final state lands inside the grace — is a normal result.
         let mut t = Tracker::default();
         let running = state(JOB2, "mods", "running", "verify", "");
         t.observe(Some(&running), true, t0);
-        assert!(
-            t.observe(Some(&running), false, t0 + Duration::from_secs(1))
-                .is_empty()
-        );
+        assert!(t.observe(Some(&running), false, t0 + secs(1)).is_empty());
         let done = state(JOB2, "mods", "succeeded", "done", "");
         assert_eq!(
-            t.observe(Some(&done), false, t0 + Duration::from_secs(2)),
+            t.observe(Some(&done), false, t0 + secs(2)),
             vec![Event::Result(done.clone())]
         );
     }
 
-    // --- delivery marker / reconnect replay ----------------------------------
+    #[test]
+    fn a_stale_running_state_is_reported_once_not_after_every_agent_restart() {
+        let host = Host::new();
+        let stale = state(JOB, "mods", "running", "mods-update", "");
+        host.write_state(&stale);
+        let t0 = Instant::now();
+
+        // First agent process: synthesizes the failure and keeps it.
+        let updater = host.updater();
+        let reported = updater.already_reported(JOB);
+        assert!(!reported);
+        let mut t = Tracker::primed(Some(&stale), reported);
+        t.observe(Some(&stale), false, t0);
+        let e = t.observe(Some(&stale), false, t0 + secs(6));
+        let [Event::Result(dead)] = e.as_slice() else {
+            panic!("expected the synthesized failure, got {e:?}");
+        };
+        updater.note_result(dead);
+
+        // Agent restarts; the state file still says `running`.
+        let restarted = host.updater();
+        assert!(restarted.already_reported(JOB));
+        let mut t = Tracker::primed(Some(&stale), restarted.already_reported(JOB));
+        assert!(t.observe(Some(&stale), false, t0).is_empty());
+        assert!(t.observe(Some(&stale), false, t0 + secs(60)).is_empty());
+        // Unacknowledged, it is still owed to the portal — from the kept copy.
+        assert_eq!(restarted.unacked_results(), vec![dead.clone()]);
+
+        // Acknowledged: gone for good, also across another restart.
+        restarted.ack(JOB);
+        assert!(restarted.unacked_results().is_empty());
+        let again = host.updater();
+        assert!(again.already_reported(JOB));
+        assert!(again.unacked_results().is_empty());
+        let mut t = Tracker::primed(Some(&stale), again.already_reported(JOB));
+        assert!(t.observe(Some(&stale), false, t0 + secs(600)).is_empty());
+    }
+
+    // --- liveness ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn liveness_prefers_the_unit_state_and_falls_back_to_proc() {
+        let host = Host::new().capable();
+        let updater = host.updater();
+        let running = state(JOB, "mods", "running", "mods-update", "");
+        host.write_state(&running);
+
+        // No /proc entry (hidepid, or simply gone) and systemd says inactive.
+        updater.refresh_liveness(&running).await;
+        assert!(!updater.helper_alive(&running));
+        assert_eq!(updater.running_job(), None);
+        assert_eq!(
+            host.systemctl_calls(),
+            ["is-active portal-gs-update@mods.service"]
+        );
+
+        // systemd says the unit is active: alive, whatever /proc shows.
+        host.unit_state("active");
+        let updater = host.updater();
+        updater.refresh_liveness(&running).await;
+        assert!(updater.helper_alive(&running));
+        assert!(updater.running_job().is_some());
+        // The answer is for that job only.
+        let other = state(JOB2, "mods", "running", "start", "");
+        assert!(!updater.helper_alive(&other));
+        // Asked at most every couple of seconds, not on every poll.
+        let calls = host.systemctl_calls().len();
+        updater.refresh_liveness(&running).await;
+        updater.refresh_liveness(&running).await;
+        assert_eq!(host.systemctl_calls().len(), calls);
+        // Nothing to ask about a finished job.
+        updater
+            .refresh_liveness(&state(JOB3, "mods", "succeeded", "done", ""))
+            .await;
+        assert_eq!(host.systemctl_calls().len(), calls);
+
+        // A job run from cron or by hand is not the unit: /proc decides.
+        host.unit_state("inactive");
+        let updater = host.updater();
+        updater.refresh_liveness(&running).await;
+        assert!(!updater.helper_alive(&running));
+        host.helper_process(4242);
+        assert!(updater.helper_alive(&running));
+
+        for (answer, alive) in [
+            ("activating", true),
+            ("deactivating", true),
+            ("failed", false),
+        ] {
+            host.unit_state(answer);
+            assert_eq!(host.updater().unit_active("mods").await, alive, "{answer}");
+        }
+    }
+
+    // --- delivery: ack and replay --------------------------------------------
 
     #[test]
-    fn a_job_that_finished_while_disconnected_is_replayed_once() {
+    fn a_result_is_replayed_on_every_connect_until_acknowledged() {
         let host = Host::new();
         let updater = host.updater();
-        assert_eq!(updater.unsent_result(), None, "nothing ever ran");
+        assert!(updater.unacked_results().is_empty(), "nothing ever ran");
 
         let done = state(JOB, "mods", "succeeded", "done", "tail");
-        std::fs::write(host.paths.state_dir.join("last-job.json"), done.to_string()).unwrap();
+        host.write_last_job(&done);
         // Since then a check overwrote state.json; the replay must not care.
         host.write_state(&state(JOB2, "check", "succeeded", "done", ""));
 
-        assert_eq!(
-            updater.unsent_result(),
-            Some(done.clone()),
-            "first connect: replay"
-        );
-        assert_eq!(
-            updater.unsent_result(),
-            Some(done.clone()),
-            "send failed: still owed"
-        );
-        updater.mark_sent(JOB);
-        assert_eq!(updater.unsent_result(), None, "delivered");
-        assert!(updater.already_sent(JOB));
+        // Sent is not received: it stays owed however often it is sent.
+        assert_eq!(updater.unacked_results(), vec![done.clone()]);
+        assert_eq!(updater.unacked_results(), vec![done.clone()]);
+        assert_eq!(host.updater().unacked_results(), vec![done.clone()]);
 
-        // A failure the agent made up (no record on disk) or a failed check
-        // must not move the marker, or JOB would be replayed again.
-        updater.delivered(&json!({"job_id": JOB2, "operation": "mods", "status": "failed", "agent_synthesized": true}));
-        updater.delivered(&state(JOB2, "check", "failed", "check", ""));
-        assert!(updater.already_sent(JOB));
-        assert_eq!(updater.unsent_result(), None);
-        // …and one that could not be sent waits for the next connection.
-        assert_eq!(updater.take_undelivered(), None);
-        updater.stash_undelivered(json!({"job_id": JOB2}));
-        assert_eq!(updater.take_undelivered(), Some(json!({"job_id": JOB2})));
-        assert_eq!(updater.take_undelivered(), None);
-
+        updater.ack(JOB);
+        assert!(updater.is_acked(JOB));
+        assert!(updater.unacked_results().is_empty());
         // Survives an agent restart…
         let restarted = host.updater();
-        assert!(restarted.already_sent(JOB));
-        assert_eq!(restarted.unsent_result(), None);
+        assert!(restarted.is_acked(JOB));
+        assert!(restarted.unacked_results().is_empty());
         // …and the next job is owed again.
         let next = state(JOB2, "game", "failed", "verify", "");
-        std::fs::write(host.paths.state_dir.join("last-job.json"), next.to_string()).unwrap();
-        assert_eq!(restarted.unsent_result(), Some(next.clone()));
-        restarted.delivered(&next);
-        assert_eq!(restarted.unsent_result(), None);
+        host.write_last_job(&next);
+        assert_eq!(restarted.unacked_results(), vec![next.clone()]);
+
+        // Acknowledging some other job changes nothing — in particular it
+        // must not make an already acknowledged one look unsent.
+        restarted.ack(JOB3);
+        assert_eq!(restarted.unacked_results(), vec![next.clone()]);
+        host.write_last_job(&done);
+        assert!(restarted.unacked_results().is_empty(), "JOB is still acked");
+        host.write_last_job(&next);
+        restarted.ack(JOB2);
+        assert!(host.updater().unacked_results().is_empty());
+    }
+
+    #[test]
+    fn only_results_the_helper_did_not_record_are_kept_by_the_agent() {
+        let host = Host::new();
+        let updater = host.updater();
+        let real = state(JOB, "mods", "succeeded", "done", "");
+        host.write_last_job(&real);
+
+        // The helper's own result: replayed from last-job.json, never
+        // stored a second time (that was the duplicate on reconnect).
+        updater.note_result(&real);
+        assert_eq!(updater.unacked_results(), vec![real.clone()]);
+        assert!(
+            !host
+                .paths
+                .agent_state_dir
+                .join("unacked-result.json")
+                .exists()
+        );
+
+        // A failed check and a synthesized failure exist only here.
+        let failed_check = state(JOB2, "check", "failed", "check", "");
+        updater.note_result(&failed_check);
+        assert_eq!(
+            updater.unacked_results(),
+            vec![real.clone(), failed_check.clone()]
+        );
+        let synthesized = json!({"job_id": JOB3, "operation": "game", "status": "failed", "agent_synthesized": true});
+        updater.note_result(&synthesized);
+        // One slot: the most recent. Never a backlog.
+        assert_eq!(
+            updater.unacked_results(),
+            vec![real.clone(), synthesized.clone()]
+        );
+        assert_eq!(
+            host.updater().unacked_results(),
+            vec![real.clone(), synthesized.clone()],
+            "kept across a restart"
+        );
+        updater.ack(JOB3);
+        assert_eq!(updater.unacked_results(), vec![real.clone()]);
+        assert_eq!(host.updater().unacked_results(), vec![real.clone()]);
+
+        // A synthesized failure for the job the helper then really finished:
+        // only the real one remains owed.
+        let guess = json!({"job_id": JOB, "operation": "mods", "status": "failed", "agent_synthesized": true});
+        updater.note_result(&guess);
+        assert_eq!(updater.unacked_results(), vec![real.clone()]);
+        updater.note_result(&real);
+        assert!(
+            !host
+                .paths
+                .agent_state_dir
+                .join("unacked-result.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_result_goes_out_once_per_connection() {
+        let real = state(JOB, "mods", "succeeded", "done", "");
+        let guess = json!({"job_id": JOB, "operation": "mods", "status": "failed", "agent_synthesized": true});
+        // Replayed on connect, then the watcher's queued copy arrives.
+        let mut sent = SentThisConnection::default();
+        assert!(sent.first_time(&real));
+        assert!(!sent.first_time(&real));
+        assert!(!sent.first_time(&real));
+        // The guess and the real result for one job are different results.
+        assert!(sent.first_time(&guess));
+        assert!(!sent.first_time(&guess));
+        assert!(sent.first_time(&state(JOB2, "game", "failed", "verify", "")));
+        // A new connection starts over: unacknowledged results are resent.
+        assert!(SentThisConnection::default().first_time(&real));
     }
 
     #[test]
@@ -1294,15 +1806,29 @@ mod tests {
         let updater = host.updater();
         let last = host.paths.state_dir.join("last-job.json");
         std::fs::write(&last, "not json").unwrap();
-        assert_eq!(updater.unsent_result(), None);
+        assert!(updater.unacked_results().is_empty());
+        host.write_last_job(&state(JOB, "mods", "running", "start", ""));
+        assert!(updater.unacked_results().is_empty());
+        host.write_last_job(&json!({"status": "failed"}));
+        assert!(updater.unacked_results().is_empty());
+        // A corrupt ack file is not a reason to resend everything forever,
+        // nor to trust what is in it.
         std::fs::write(
-            &last,
-            state(JOB, "mods", "running", "start", "").to_string(),
+            host.paths.agent_state_dir.join("acked-jobs"),
+            format!("garbage\n{JOB}\n../../etc/passwd\n"),
         )
         .unwrap();
-        assert_eq!(updater.unsent_result(), None);
-        std::fs::write(&last, json!({"status": "failed"}).to_string()).unwrap();
-        assert_eq!(updater.unsent_result(), None);
+        let updater = host.updater();
+        assert!(updater.is_acked(JOB));
+        assert!(!updater.is_acked("garbage"));
+        // Only the last few acknowledgements are kept.
+        for i in 0..20 {
+            updater.ack(&format!("00000000-0000-4000-8000-{i:012}"));
+        }
+        assert!(!updater.is_acked(JOB));
+        assert!(updater.is_acked("00000000-0000-4000-8000-000000000019"));
+        let kept = std::fs::read_to_string(host.paths.agent_state_dir.join("acked-jobs")).unwrap();
+        assert_eq!(kept.lines().count(), 8);
     }
 
     #[test]
@@ -1332,7 +1858,7 @@ mod tests {
     // --- starting jobs -------------------------------------------------------
 
     #[test]
-    fn systemctl_is_asked_to_start_exactly_the_template_instance() {
+    fn job_ids_and_unit_names() {
         assert_eq!(
             systemctl_args("repair-config"),
             [
@@ -1369,6 +1895,10 @@ mod tests {
             request,
             json!({"job_id": JOB, "operation": "mods", "trigger": "portal"})
         );
+        assert_eq!(
+            host.systemctl_calls(),
+            ["--no-ask-password start --no-block portal-gs-update@mods.service"]
+        );
         // Before the helper has written anything the job already counts.
         assert_eq!(
             updater.running_job(),
@@ -1396,6 +1926,7 @@ mod tests {
             !host.paths.run_dir.join("request.json").exists(),
             "no request for a refused start"
         );
+        assert!(host.systemctl_calls().is_empty());
         assert_eq!(
             updater.running_job(),
             Some(
@@ -1455,6 +1986,7 @@ mod tests {
             ("mods; reboot", JOB),
             ("", JOB),
             ("MODS", JOB),
+            ("verify-config", JOB),
             ("mods", "not-a-uuid"),
             ("mods", "0b0e3c5e-7f0a-4c1d-9b7e-1a2b3c4d5e6f; reboot"),
         ] {
@@ -1464,6 +1996,7 @@ mod tests {
             );
         }
         assert!(!host.paths.run_dir.join("request.json").exists());
+        assert!(host.systemctl_calls().is_empty());
         assert_eq!(updater.running_job(), None);
 
         // No helper on this host: refused, clearly.
@@ -1480,7 +2013,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_systemctl_releases_the_claim() {
         let mut host = Host::new().capable();
-        host.paths.systemctl = "false".into();
+        host.start_fails();
         let updater = host.updater();
         let err = updater
             .start("mods", JOB, "portal")
@@ -1501,35 +2034,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_unit_that_never_writes_state_is_reported_failed() {
+    async fn a_started_unit_is_not_failed_while_systemd_says_it_is_active() {
         let host = Host::new().capable();
         let updater = host.updater();
         updater.start("mods", JOB, "portal").await.unwrap();
         let now = Instant::now();
 
+        // Within the grace period nothing is decided, and systemd not asked.
+        assert_eq!(updater.pending_overdue(now + secs(5)), None);
+        assert_eq!(updater.settle_pending(None, now + secs(5), false), None);
+        // After it: ask about exactly that unit…
         assert_eq!(
-            updater.settle_pending(None, now + Duration::from_secs(30)),
-            None
+            updater.pending_overdue(now + secs(11)).as_deref(),
+            Some("mods")
         );
+        // …and as long as it is active (waiting for the lock behind the
+        // nightly cron, or running but unable to publish), keep waiting —
+        // for hours if need be.
+        assert_eq!(updater.settle_pending(None, now + secs(11), true), None);
+        assert_eq!(updater.settle_pending(None, now + secs(61), true), None);
+        assert_eq!(updater.settle_pending(None, now + secs(7200), true), None);
         assert!(updater.running_job().is_some());
         // Someone else's state does not settle it.
         let other = state(JOB2, "game", "succeeded", "done", "");
         assert_eq!(
-            updater.settle_pending(Some(&other), now + Duration::from_secs(30)),
+            updater.settle_pending(Some(&other), now + secs(61), true),
             None
         );
 
+        // The unit is gone and left nothing: that is a failure.
         let failure = updater
-            .settle_pending(Some(&other), now + Duration::from_secs(61))
+            .settle_pending(Some(&other), now + secs(7201), false)
             .unwrap();
         assert_eq!(failure["job_id"], JOB);
         assert_eq!(failure["operation"], "mods");
         assert_eq!(failure["status"], "failed");
-        assert!(failure["error"].as_str().unwrap().contains("did not start"));
+        assert_eq!(failure["agent_synthesized"], true);
+        assert!(
+            failure["error"]
+                .as_str()
+                .unwrap()
+                .contains("without reporting")
+        );
         assert_eq!(updater.running_job(), None);
         assert!(!host.paths.run_dir.join("request.json").exists());
         assert_eq!(
-            updater.settle_pending(None, now + Duration::from_secs(120)),
+            updater.settle_pending(None, now + secs(9000), false),
             None,
             "reported once"
         );
@@ -1538,24 +2088,49 @@ mod tests {
         updater.start("mods", JOB2, "portal").await.unwrap();
         let picked_up = state(JOB2, "mods", "running", "init", "");
         assert_eq!(
-            updater.settle_pending(Some(&picked_up), now + Duration::from_secs(300)),
+            updater.settle_pending(Some(&picked_up), now + secs(300), false),
             None
         );
+        assert_eq!(updater.pending_overdue(now + secs(9999)), None);
+    }
+
+    #[tokio::test]
+    async fn a_job_that_could_not_publish_is_reported_from_the_helpers_record() {
+        // The run directory was full: no state.json ever appeared, but the
+        // helper ran and recorded its result. That is the result — not "the
+        // helper did not start".
+        let host = Host::new().capable();
+        let updater = host.updater();
+        updater.start("repair-config", JOB, "portal").await.unwrap();
+        let recorded = state(JOB, "repair-config", "succeeded", "done", "");
+        host.write_last_job(&recorded);
+        let got = updater.settle_pending(None, Instant::now() + secs(1), true);
+        assert_eq!(got, Some(recorded.clone()));
+        assert!(!is_synthesized(&recorded));
+        assert_eq!(updater.running_job(), None);
+        // An older job's record is not ours.
+        updater
+            .start("repair-config", JOB2, "portal")
+            .await
+            .unwrap();
         assert_eq!(
-            updater.running_job(),
-            None,
-            "no helper process in this test"
+            updater.settle_pending(None, Instant::now() + secs(1), true),
+            None
         );
     }
 
-    // --- auto-repair ---------------------------------------------------------
+    // --- auto-repair, reload -------------------------------------------------
 
-    #[tokio::test]
-    async fn auto_repair_is_claimed_once_per_ten_minutes_and_only_when_definitely_broken() {
-        let health = |wired, applied| ConfigHealth {
+    fn health(wired: Option<bool>, applied: Option<bool>) -> ConfigHealth {
+        ConfigHealth {
             demo_upload_wired: wired,
             overrides_applied: applied,
-        };
+            auto_repair: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_repair_only_when_definitely_broken_idle_and_allowed() {
         let unwired = health(Some(false), None);
         let host = Host::new().capable();
         let updater = host.updater();
@@ -1566,23 +2141,106 @@ mod tests {
             "unknown is not broken"
         );
         assert!(!updater.claim_auto_repair(health(Some(true), None), t0));
+        // The operator's switch (AUTO_REPAIR=false in gs-update.conf).
+        let off = ConfigHealth {
+            auto_repair: false,
+            ..unwired
+        };
+        assert!(!updater.claim_auto_repair(off, t0));
+        assert!(!updater.claim_auto_repair(off, t0 + secs(100_000)));
+
         assert!(updater.claim_auto_repair(unwired, t0));
-        assert!(!updater.claim_auto_repair(unwired, t0 + Duration::from_secs(30)));
-        assert!(!updater.claim_auto_repair(unwired, t0 + Duration::from_secs(599)));
-        assert!(updater.claim_auto_repair(unwired, t0 + Duration::from_secs(600)));
-        // Overrides not applied is a reason too, under the same limit.
-        let stale_overrides = health(Some(true), Some(false));
-        assert!(!updater.claim_auto_repair(stale_overrides, t0 + Duration::from_secs(700)));
-        assert!(updater.claim_auto_repair(stale_overrides, t0 + Duration::from_secs(1200)));
+        assert!(!updater.claim_auto_repair(unwired, t0 + secs(30)));
+        // Overrides not applied is a reason too.
+        let host = Host::new().capable();
+        assert!(
+            host.updater()
+                .claim_auto_repair(health(Some(true), Some(false)), t0)
+        );
 
         // Never on top of a running job, and that does not use up the slot.
+        let host = Host::new().capable();
+        let updater = host.updater();
         updater.start("mods", JOB, "portal").await.unwrap();
-        assert!(!updater.claim_auto_repair(unwired, t0 + Duration::from_secs(3000)));
-        updater.settle_pending(None, Instant::now() + Duration::from_secs(61));
-        assert!(updater.claim_auto_repair(unwired, t0 + Duration::from_secs(3000)));
+        assert!(!updater.claim_auto_repair(unwired, t0));
+        updater.settle_pending(None, Instant::now() + secs(61), false);
+        assert!(updater.claim_auto_repair(unwired, t0));
 
         // Not on a host without the helper.
         assert!(!Host::new().updater().claim_auto_repair(unwired, t0));
+    }
+
+    #[test]
+    fn auto_repair_backs_off_while_repairs_do_not_help_and_resets_when_healthy() {
+        let broken = health(Some(true), Some(false));
+        let host = Host::new().capable();
+        let updater = host.updater();
+        let t0 = Instant::now();
+        let mut t = t0;
+        let mut gaps = Vec::new();
+        assert!(updater.claim_auto_repair(broken, t));
+        // Poll once a minute, as heartbeats would, for three days.
+        let mut last = t;
+        for _ in 0..(3 * 24 * 60) {
+            t += secs(60);
+            if updater.claim_auto_repair(broken, t) {
+                gaps.push(t.duration_since(last).as_secs() / 60);
+                last = t;
+            }
+        }
+        // 10 min, 20, 40, … then every 6 hours: not every 10 minutes forever.
+        assert_eq!(&gaps[..7], [10, 20, 40, 80, 160, 320, 360]);
+        assert!(gaps[7..].iter().all(|g| *g == 360), "{gaps:?}");
+
+        // One healthy reading and the next breakage is repaired promptly.
+        assert!(!updater.claim_auto_repair(health(Some(true), Some(true)), t));
+        t += secs(600);
+        assert!(updater.claim_auto_repair(broken, t));
+        assert!(!updater.claim_auto_repair(broken, t + secs(599)));
+        assert!(updater.claim_auto_repair(broken, t + secs(600)));
+        // "Unknown" is not "healthy": it does not reset anything.
+        assert!(!updater.claim_auto_repair(health(None, None), t + secs(700)));
+        assert!(!updater.claim_auto_repair(broken, t + secs(1200)));
+        assert!(updater.claim_auto_repair(broken, t + secs(1800)));
+    }
+
+    #[test]
+    fn reload_waits_for_an_idle_server() {
+        assert!(reload_allowed(Some(&json!({"gamestate": "none"}))));
+        for busy in ["warmup", "knife", "live", "paused", "post_game", ""] {
+            assert!(
+                !reload_allowed(Some(&json!({"gamestate": busy}))),
+                "{busy:?}"
+            );
+        }
+        // No answer (RCON down, plugin stack not loaded) is not "idle".
+        assert!(!reload_allowed(None));
+        assert!(!reload_allowed(Some(&json!({}))));
+        assert!(!reload_allowed(Some(&json!({"gamestate": null}))));
+    }
+
+    #[test]
+    fn a_repair_leaves_a_reload_pending_until_it_is_done() {
+        let host = Host::new();
+        let updater = host.updater();
+        assert!(!updater.reload_pending());
+        let mut repaired = state(JOB, "repair-config", "succeeded", "done", "");
+        // Not every result asks for one…
+        updater.note_result(&repaired);
+        assert!(!updater.reload_pending());
+        // …a failed repair does not either…
+        let mut failed = state(JOB2, "repair-config", "failed", "reconcile-config", "");
+        failed["needs_reload"] = json!(true);
+        updater.note_result(&failed);
+        assert!(!updater.reload_pending());
+        // …a successful one does, and it stays set (match in progress, RCON
+        // down) until the reload has actually happened.
+        repaired["needs_reload"] = json!(true);
+        updater.note_result(&repaired);
+        assert!(updater.reload_pending());
+        assert!(updater.reload_pending());
+        updater.reload_done();
+        assert!(!updater.reload_pending());
     }
 
     // --- config health -------------------------------------------------------
@@ -1601,12 +2259,13 @@ mod tests {
             "no report yet"
         );
         assert!(!updater.config_health().needs_repair());
+        assert!(updater.config_health().auto_repair);
 
         write_config(
             &host,
             &json!({
                 "checked_at": "2026-11-21T04:00:00Z", "demo_upload_wired": true,
-                "overrides_applied": null, "reason": null,
+                "overrides_applied": null, "reason": null, "auto_repair": true,
             }),
         );
         let health = updater.config_health();
@@ -1620,19 +2279,24 @@ mod tests {
         );
         assert_eq!(updater.config_health().demo_upload_wired, Some(false));
         assert!(updater.config_health().needs_repair());
+        assert!(
+            updater.config_health().auto_repair,
+            "absent (older helper) means allowed"
+        );
         write_config(
             &host,
-            &json!({"demo_upload_wired": null, "overrides_applied": false}),
+            &json!({"demo_upload_wired": null, "overrides_applied": false, "auto_repair": false}),
         );
         assert_eq!(updater.config_health().demo_upload_wired, None);
         assert!(updater.config_health().needs_repair());
+        assert!(!updater.config_health().auto_repair);
 
         // Garbage, or the wrong types, is "unknown" — never "broken".
         std::fs::write(host.paths.run_dir.join("config.json"), "{ not json").unwrap();
         assert_eq!(updater.config_health(), ConfigHealth::default());
         write_config(
             &host,
-            &json!({"demo_upload_wired": "false", "overrides_applied": 0}),
+            &json!({"demo_upload_wired": "false", "overrides_applied": 0, "auto_repair": "no"}),
         );
         assert_eq!(updater.config_health(), ConfigHealth::default());
     }
@@ -1646,9 +2310,9 @@ mod tests {
             &json!({"demo_upload_wired": false, "overrides_applied": false}),
         );
         let path = host.paths.run_dir.join("config.json");
-        let set_age = |secs: u64| {
+        let set_age = |age: u64| {
             let file = std::fs::File::options().write(true).open(&path).unwrap();
-            file.set_modified(std::time::SystemTime::now() - Duration::from_secs(secs))
+            file.set_modified(std::time::SystemTime::now() - secs(age))
                 .unwrap();
         };
         set_age(14 * 60);
@@ -1666,54 +2330,34 @@ mod tests {
         let updater = host.updater();
         let t0 = Instant::now();
         assert!(updater.verify_config(false, t0).await, "first time");
+        assert!(!updater.verify_config(false, t0 + secs(299)).await);
         assert!(
-            !updater
-                .verify_config(false, t0 + Duration::from_secs(299))
-                .await
-        );
-        assert!(
-            updater
-                .verify_config(true, t0 + Duration::from_secs(10))
-                .await,
+            updater.verify_config(true, t0 + secs(10)).await,
             "connect forces"
         );
         assert!(
-            !updater
-                .verify_config(false, t0 + Duration::from_secs(300))
-                .await,
+            !updater.verify_config(false, t0 + secs(300)).await,
             "counted from the last run"
         );
-        assert!(
-            updater
-                .verify_config(false, t0 + Duration::from_secs(310))
-                .await
-        );
+        assert!(updater.verify_config(false, t0 + secs(310)).await);
         // It is not a job: nothing is claimed, no request is written.
         assert_eq!(updater.running_job(), None);
         assert!(!host.paths.run_dir.join("request.json").exists());
         assert_eq!(
-            systemctl_args("verify-config").last().unwrap(),
-            "portal-gs-update@verify-config.service"
+            host.systemctl_calls(),
+            ["--no-ask-password start --no-block portal-gs-update@verify-config.service"; 3]
         );
 
         // Never while a job runs, not even on connect; and the turn is kept.
         updater.start("mods", JOB, "portal").await.unwrap();
-        assert!(
-            !updater
-                .verify_config(true, t0 + Duration::from_secs(1000))
-                .await
-        );
-        updater.settle_pending(None, Instant::now() + Duration::from_secs(61));
-        assert!(
-            updater
-                .verify_config(false, t0 + Duration::from_secs(1000))
-                .await
-        );
+        assert!(!updater.verify_config(true, t0 + secs(1000)).await);
+        updater.settle_pending(None, Instant::now() + secs(61), false);
+        assert!(updater.verify_config(false, t0 + secs(1000)).await);
 
         // Not on a host without the helper; a failing systemctl is not fatal.
         assert!(!Host::new().updater().verify_config(true, t0).await);
-        let mut broken = Host::new().capable();
-        broken.paths.systemctl = "false".into();
+        let broken = Host::new().capable();
+        broken.start_fails();
         assert!(!broken.updater().verify_config(true, t0).await);
     }
 }

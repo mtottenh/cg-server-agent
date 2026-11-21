@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for dist/portal-gs-update against a fake game tree and a fake
+# Tests for dist/gs-update/portal-gs-update against a fake game tree and a fake
 # LinuxGSM script (fake-lgsm.sh). Plain bash, no framework, no root, no
 # network: `tests/helper/run.sh` from anywhere. Needs jq, flock, tar and
 # python3 (zstd if present; the helper falls back to gzip without it).
@@ -11,7 +11,7 @@
 set -uo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
-HELPER=${HELPER:-$here/../../dist/portal-gs-update}
+HELPER=${HELPER:-$here/../../dist/gs-update/portal-gs-update}
 FILTER=${1:-}
 TOKEN='tok_SUPERSECRET_demo_token_0123456789'
 BASE=$(mktemp -d "${TMPDIR:-/tmp}/gs-update-test.XXXXXX")
@@ -56,6 +56,10 @@ no_secrets() {
         hasnt "$f" 'lgsm-rcon-secret'
         hasnt "$f" 'console-rcon-secret'
         hasnt "$f" 'OLDSECRET'
+        hasnt "$f" 'latin1-token-secret'
+        hasnt "$f" 'latin1-rcon-secret'
+        hasnt "$f" 'inline-raw-secret'
+        hasnt "$f" 'MixedCaseSecret'
     done
 }
 
@@ -166,6 +170,7 @@ helper() { # helper <op> — sets RC, output in $OUT
         GS_UPDATE_MMS_URL="file://$T/mms-latest" \
         GS_UPDATE_VERIFY_POLL=0.2 \
         GS_UPDATE_PUMP_INTERVAL=0.05 \
+        GS_UPDATE_LOCK_WAIT=1 \
         ${EXTRA_ENV:+$EXTRA_ENV} \
         "$HELPER" "$@" >"$OUT" 2>&1
     RC=$?
@@ -218,7 +223,7 @@ test_check_reports_installed_and_latest() {
     eq "exit status" 0 "$RC"
     st_eq .operation check
     st_eq .status succeeded
-    st_eq .phase done
+    st_eq .phase "done"
     st_eq .before.lgsm v26.6.0
     st_eq .before.cs2_build 1000
     st_eq .before.cssharp 370
@@ -281,7 +286,7 @@ test_mods_update_reasserts_block_and_reports_config() {
     eq "exit status" 0 "$RC"
     st_eq .operation mods
     st_eq .status succeeded
-    st_eq .phase done
+    st_eq .phase "done"
     st_eq .restarted true
     st_eq .demo_upload_block_present true
     st_eq .load.matchzy true
@@ -290,7 +295,10 @@ test_mods_update_reasserts_block_and_reports_config() {
     st_eq .after.cssharp 380
     eq "installed.json cssharp" 380 "$(jq -r .cssharp "$STATE/installed.json")"
     cfg_eq .demo_upload_wired true
-    cfg_eq .overrides_applied true
+    # Six of the eight lines were refused: what is in the file is not what
+    # was asked for, and the report says so instead of "applied".
+    cfg_eq .overrides_applied false
+    cfg_eq .reason '6 line(s) of the MatchZy overrides file were rejected by the helper (or the file is unreadable)'
     eq "calls" 'stop,mods-update,start,' "$(calls)"
     eq "new plugin files landed" 0.9.3 "$(cat "$CSGO/addons/matchzy/VERSION")"
 
@@ -532,7 +540,7 @@ test_verify_config_reports_wiring_from_the_file() {
     cfg_eq .reason null
     [[ $(jq -r .checked_at "$RUN/config.json") =~ ^20[0-9-]+T[0-9:]+Z$ ]] || bad "checked_at is not a timestamp"
     eq "config.json mode" 644 "$(stat -c %a "$RUN/config.json")"
-    eq "keys" 'checked_at,demo_upload_wired,overrides_applied,reason' "$(jq -r 'keys | join(",")' "$RUN/config.json")"
+    eq "keys" 'auto_repair,checked_at,demo_upload_wired,overrides_applied,reason' "$(jq -r 'keys | join(",")' "$RUN/config.json")"
     # Not a job: no state, no record, LinuxGSM never called, nothing left behind.
     [ ! -e "$RUN/state.json" ] || bad "verify-config must not write state.json"
     [ ! -e "$STATE/last-job.json" ] || bad "verify-config must not write last-job.json"
@@ -679,7 +687,7 @@ test_state_is_published_while_the_job_runs() {
     OUT=$first_out
     wait "$bg"
     st_eq .status succeeded
-    st_eq .phase done
+    st_eq .phase "done"
     [ ! -e "/proc/$pid" ] || bad "helper pid should be gone"
 }
 
@@ -691,7 +699,7 @@ test_lock_contention_fails_fast() {
     sleep 0.3
     helper mods
     eq "exit status" 75 "$RC"
-    has "$OUT" 'lock held'
+    has "$OUT" 'lock still held'
     cmp -s "$T/state.before" "$RUN/state.json" || bad "a refused run must not touch state.json"
     eq "calls" 'check-update,' "$(calls)"
     kill "$holder" 2>/dev/null
@@ -754,6 +762,440 @@ test_log_tail_is_bounded() {
     [ "$n" -le 4096 ] || bad "log_tail is $n bytes"
     [ "$n" -gt 1000 ] || bad "log_tail suspiciously short ($n)"
     has "$OUT" 'steamcmd progress line 1 of many'
+}
+
+# --- adversarial review, round 1 ---------------------------------------------
+
+helper_bg() { # like helper, but exec'd in the background: $! is the helper itself
+    (exec env -i PATH="$PATH" HOME="$T" \
+        GS_UPDATE_CONF="$T/etc/gs-update.conf" GS_UPDATE_RUN_DIR="$RUN" GS_UPDATE_STATE_DIR="$STATE" \
+        GS_UPDATE_SNIPPET="$T/etc/matchzy_portal.cfg" GS_UPDATE_OVERRIDES="$T/etc/matchzy_overrides.cfg" \
+        GS_UPDATE_LGSM_DIRECT=1 GS_UPDATE_NO_SYSLOG=1 \
+        GS_UPDATE_GITHUB_API="file://$T/api" GS_UPDATE_MMS_URL="file://$T/mms-latest" \
+        GS_UPDATE_VERIFY_POLL=0.2 GS_UPDATE_PUMP_INTERVAL=0.05 GS_UPDATE_LOCK_WAIT=1 \
+        "$HELPER" "$@" >"$OUT" 2>&1) &
+}
+wait_for_phase() { # wait_for_phase <phase> [log line] — up to 10 s
+    local _
+    for _ in $(seq 1 100); do
+        if [ "$(jq -r .phase "$RUN/state.json" 2>/dev/null)" = "$1" ] \
+            && { [ -z "${2:-}" ] || grep -qF -- "$2" "$RUN/state.json"; }; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    bad "never reached phase $1"
+}
+
+# 1. Root must never read a name in the agent-writable run directory.
+test_planted_state_link_is_never_read() {
+    echo 'root-only-secret-content' >"$T/victim"
+    # Writable directory: the link is replaced by a real file, target untouched.
+    ln -s "$T/victim" "$RUN/state.json"
+    ln -s "$T/victim" "$RUN/config.json"
+    helper repair-config
+    eq "exit status" 0 "$RC"
+    [ -f "$RUN/state.json" ] && [ ! -L "$RUN/state.json" ] || bad "state.json should be a regular file now"
+    [ -f "$RUN/config.json" ] && [ ! -L "$RUN/config.json" ] || bad "config.json should be a regular file now"
+    eq "link target untouched" 'root-only-secret-content' "$(cat "$T/victim")"
+    hasnt "$STATE/last-job.json" 'root-only-secret-content'
+    eq "last-job.json is the job" succeeded "$(jq -r .status "$STATE/last-job.json")"
+
+    # The reviewer's case: publishing fails (tmpfs full / not writable), so
+    # the planted link survives. last-job.json must still be the job's own
+    # record, not a copy of whatever the link points at.
+    rm -f "$RUN/state.json" "$RUN/config.json" "$STATE/last-job.json"
+    ln -s "$T/victim" "$RUN/state.json"
+    chmod 0555 "$RUN"
+    helper repair-config
+    chmod 0755 "$RUN"
+    eq "exit status (publish impossible)" 0 "$RC"
+    [ -L "$RUN/state.json" ] || bad "test setup: the link should have survived"
+    hasnt "$STATE/last-job.json" 'root-only-secret-content'
+    eq "last-job.json status" succeeded "$(jq -r .status "$STATE/last-job.json")"
+    eq "last-job.json says publishing failed" true "$(jq -r .state_publish_failed "$STATE/last-job.json")"
+    has "$OUT" 'cannot publish state.json'
+    eq "link target untouched" 'root-only-secret-content' "$(cat "$T/victim")"
+    # A directory or FIFO planted at the name is cleared too.
+    rm -f "$RUN/state.json"
+    mkdir "$RUN/state.json"
+    touch "$RUN/state.json/x"
+    mkfifo "$RUN/config.json"
+    helper repair-config
+    eq "exit status (planted dir/fifo)" 0 "$RC"
+    [ -f "$RUN/state.json" ] && [ -f "$RUN/config.json" ] || bad "planted dir/fifo should have been replaced"
+}
+
+# 2. Redaction must not depend on the line being valid UTF-8.
+test_redaction_survives_invalid_utf8_and_odd_config_lines() {
+    touch "$FAKE/latin1"
+    # Secrets where a name-anchored rule would miss them.
+    sed -i '2i foo 1; matchzy_demo_upload_header_value "inline-raw-secret"\nMatchZy_Remote_Log_Header_Value "MixedCaseSecret"' "$CFG"
+    helper mods
+    eq "exit status" 0 "$RC"
+    has "$OUT" '[redacted line]'
+    eq "redacted lines in the output" 4 "$(grep -c 'redacted line' "$OUT")"
+    eq "inline secret" '{"name":"foo","before":"[redacted]","after":"[redacted]"}' \
+        "$(st -c '.config_report.cvars_changed[], (.config_report.cvars_removed[] | {name: ., before: "[redacted]", after: "[redacted]"}) | select(.name == "foo")')"
+    [ "$(st '[.config_report.cvars_removed[] | select(. == "MatchZy_Remote_Log_Header_Value")] | length')" = 1 ] \
+        || bad "mixed-case cvar should be listed as removed (by name only)"
+    no_secrets
+    # And when such a value changes rather than disappears.
+    echo 'MatchZy_Remote_Log_Header_Value "x"' >>"$FAKE/mods_next/cfg/MatchZy/config.cfg"
+    echo 'foo 2' >>"$FAKE/mods_next/cfg/MatchZy/config.cfg"
+    sed -i '2i foo 1; matchzy_demo_upload_header_value "inline-raw-secret"\nMatchZy_Remote_Log_Header_Value "MixedCaseSecret"' "$CFG"
+    helper mods
+    eq "mixed case redacted" '{"name":"MatchZy_Remote_Log_Header_Value","before":"[redacted]","after":"[redacted]"}' \
+        "$(st -c '.config_report.cvars_changed[] | select(.name == "MatchZy_Remote_Log_Header_Value")')"
+    eq "inline redacted" '{"name":"foo","before":"[redacted]","after":"2"}' \
+        "$(st -c '.config_report.cvars_changed[] | select(.name == "foo")')"
+    no_secrets
+}
+
+# 3. The snapshot a rollback needs is never pruned, and nothing live is
+#    deleted before the archive is known to be good.
+test_rollback_snapshot_survives_pruning_under_clock_skew() {
+    local i
+    mkdir -p "$STATE/snapshots"
+    for i in 1 2 3; do
+        echo x >"$STATE/snapshots/0000000$i-0000-0000-0000-000000000000.tar.zst"
+        touch -d '+2 days' "$STATE/snapshots/0000000$i-0000-0000-0000-000000000000.tar.zst"
+    done
+    touch "$FAKE/mods_next/addons/BROKEN"
+    helper mods
+    eq "exit status" 3 "$RC"
+    st_eq .status rolled_back
+    eq "previous plugin files restored" 0.9.2 "$(cat "$CSGO/addons/matchzy/VERSION")"
+    [ -e "$STATE/snapshots/$(st .job_id).tar.gz" ] || [ -e "$STATE/snapshots/$(st .job_id).tar.zst" ] \
+        || bad "this job's snapshot was pruned"
+    eq "snapshots kept (SNAPSHOT_KEEP=2)" 2 "$(find "$STATE/snapshots" -type f | wc -l)"
+}
+
+test_unreadable_snapshot_does_not_delete_the_live_tree() {
+    echo "$STATE/snapshots" >"$FAKE/corrupt"
+    touch "$FAKE/mods_next/addons/BROKEN"
+    helper mods
+    eq "exit status" 1 "$RC"
+    st_eq .status failed
+    [[ $(st .error) == *'restoring the snapshot'*'also failed'* ]] || bad "error: $(st .error)"
+    has "$OUT" 'snapshot is missing or unreadable - leaving the current files in place'
+    # The update's files are still there — a broken plugin set, not an empty tree.
+    [ -d "$CSGO/addons/metamod" ] || bad "addons/ was deleted"
+    eq "updated files left in place" 0.9.3 "$(cat "$CSGO/addons/matchzy/VERSION")"
+    [ -s "$CFG" ] || bad "cfg/MatchZy was deleted"
+    eq "server started anyway" 'stop,mods-update,start,stop,start,' "$(calls)"
+    eq "no staging left" 0 "$(find "$CSGO" -maxdepth 1 -name '.portal-*' | wc -l)"
+}
+
+test_snapshot_leaves_out_plugin_logs_and_restores_by_swap() {
+    mkdir -p "$CSGO/addons/counterstrikesharp/logs"
+    echo 'log line' >"$CSGO/addons/counterstrikesharp/logs/log-today.txt"
+    touch "$FAKE/mods_next/addons/BROKEN"
+    helper mods
+    st_eq .status rolled_back
+    local snap
+    snap=$(find "$STATE/snapshots" -type f | head -n 1)
+    if tar -tf "$snap" | grep -q '/logs'; then bad "plugin logs are in the snapshot"; fi
+    tar -tf "$snap" | grep -q '^addons/matchzy/VERSION$' || bad "snapshot lacks the plugin files"
+    tar -tf "$snap" | grep -q '^cfg/MatchZy/config.cfg$' || bad "snapshot lacks the MatchZy config"
+    eq "no staging left" 0 "$(find "$CSGO" -maxdepth 1 -name '.portal-*' | wc -l)"
+    [ ! -e "$CSGO/addons/BROKEN" ] || bad "the failed update's files should be gone"
+}
+
+# 6. An interrupted job must not leave the server down.
+test_sigterm_while_the_server_is_stopped_starts_it_again() {
+    echo 2000 >"$FAKE/remote_build"
+    echo 30 >"$FAKE/slow"
+    helper_bg all
+    local pid=$!
+    wait_for_phase game-update 'SteamCMD downloading'
+    kill -TERM "$pid"
+    wait "$pid"
+    eq "exit status" 143 "$?"
+    st_eq .status failed
+    st_eq .failed_phase game-update
+    st_eq .restarted true
+    st_eq .load.matchzy true
+    [[ $(st .error) == *'interrupted (status 143) during phase game-update'*'plugin files were not touched'*'server started and the plugin stack loaded'* ]] \
+        || bad "error: $(st .error)"
+    eq "calls" 'update-lgsm,stop,update,start,' "$(calls)"
+    eq "server state" running "$(cat "$FAKE/running")"
+    eq "last-job.json" failed "$(jq -r .status "$STATE/last-job.json")"
+    cfg_eq .demo_upload_wired true
+    # The LinuxGSM command it was running is gone with it (no orphan without the lock).
+    sleep 0.3
+    if pgrep -f "$GS/cs2server update" >/dev/null; then bad "the LinuxGSM child is still running"; fi
+    eq "work dirs left" 0 "$(find "$STATE" -maxdepth 1 -name '.work.*' | wc -l)"
+}
+
+test_sigterm_during_mods_update_restores_the_snapshot() {
+    echo 30 >"$FAKE/slow_mods"
+    cp -p "$CFG" "$T/config.before"
+    helper_bg mods
+    local pid=$!
+    wait_for_phase mods-update 'extracting'
+    eq "half-updated files are on disk" 0.9.3 "$(cat "$CSGO/addons/matchzy/VERSION")"
+    kill -TERM "$pid"
+    wait "$pid"
+    eq "exit status" 143 "$?"
+    st_eq .status failed
+    st_eq .failed_phase mods-update
+    st_eq .restarted true
+    st_eq .config_report null
+    [[ $(st .error) == *'during phase mods-update; plugin files restored from'*'server started and the plugin stack loaded'* ]] \
+        || bad "error: $(st .error)"
+    eq "previous plugin files restored" 0.9.2 "$(cat "$CSGO/addons/matchzy/VERSION")"
+    [ ! -e "$CSGO/addons/matchzy/NewFile.dll" ] || bad "the update's new files should be gone"
+    cmp -s "$T/config.before" "$CFG" || bad "config.cfg should be back to the pre-update file"
+    eq "calls" 'stop,mods-update,stop,start,' "$(calls)"
+    eq "server state" running "$(cat "$FAKE/running")"
+    st_eq .after.matchzy 0.9.2
+}
+
+test_sigterm_outside_a_transaction_just_fails() {
+    echo 30 >"$FAKE/slow"
+    echo 2000 >"$FAKE/remote_build"
+    helper_bg game
+    local pid=$!
+    wait_for_phase game-update 'SteamCMD downloading'
+    kill -TERM "$pid"
+    wait "$pid"
+    st_eq .status failed
+    # `update` may have had the server down: it is started, nothing restored.
+    eq "calls" 'update,start,' "$(calls)"
+    [[ $(st .error) == *'plugin files were not touched'* ]] || bad "error: $(st .error)"
+}
+
+# 7. A job waits for the lock; verify-config never does.
+test_job_waits_for_a_lock_held_briefly() {
+    helper check
+    flock "$RUN/lock" sleep 0.6 &
+    local holder=$!
+    sleep 0.2
+    : >"$FAKE/calls"
+    helper repair-config
+    eq "exit status" 0 "$RC"
+    st_eq .operation repair-config
+    wait "$holder"
+    # Reviewer's race: verify-config and a job started at the same moment.
+    local i busy=0
+    for i in $(seq 1 15); do
+        helper_bg verify-config
+        local v=$!
+        OUT="$T/out-job.txt" helper repair-config
+        [ "$RC" = 0 ] || busy=$((busy + 1))
+        wait "$v"
+    done
+    eq "jobs that lost to verify-config" 0 "$busy"
+}
+
+# 8. Agent-writable inputs: one open, no links, no FIFOs, a real size cap.
+test_untrusted_inputs_are_not_followed_or_overread() {
+    # Overrides through a symlink: refused, even though the target is fine.
+    echo 'matchzy_minimum_ready_required 5' >"$T/etc/real-overrides"
+    ln -s "$T/etc/real-overrides" "$T/etc/matchzy_overrides.cfg"
+    helper repair-config
+    eq "exit status" 0 "$RC"
+    hasnt "$CFG" 'matchzy_minimum_ready_required "5"'
+    cfg_eq .overrides_applied false
+    has "$OUT" 'not a plain file'
+    # Past the cap: nothing of it is used (not even the lines before the cap).
+    rm "$T/etc/matchzy_overrides.cfg"
+    { echo 'matchzy_first 1'; head -c 70000 /dev/zero | tr '\0' '\n'; echo 'matchzy_past_the_cap 1'; } >"$T/etc/matchzy_overrides.cfg"
+    helper repair-config
+    hasnt "$CFG" matchzy_past_the_cap
+    hasnt "$CFG" matchzy_first
+    cfg_eq .overrides_applied false
+    # A FIFO does not hang the helper.
+    rm "$T/etc/matchzy_overrides.cfg"
+    mkfifo "$T/etc/matchzy_overrides.cfg"
+    local t0=$SECONDS
+    helper repair-config
+    eq "exit status (fifo overrides)" 0 "$RC"
+    [ $((SECONDS - t0)) -lt 8 ] || bad "a FIFO stalled the helper for $((SECONDS - t0))s"
+    cfg_eq .overrides_applied false
+    rm "$T/etc/matchzy_overrides.cfg"
+
+    # The snippet through a symlink: treated as no snippet, never copied.
+    echo 'SECRET-OTHER-FILE' >"$T/other"
+    rm "$T/etc/matchzy_portal.cfg"
+    ln -s "$T/other" "$T/etc/matchzy_portal.cfg"
+    helper repair-config
+    hasnt "$CFG" SECRET-OTHER-FILE
+    cfg_eq .demo_upload_wired null
+
+    # request.json: a link, a FIFO, a directory, or something big → 65, at once.
+    ln -s "$T/other" "$RUN/request.json"
+    helper repair-config
+    eq "exit status (symlink request)" 65 "$RC"
+    hasnt "$OUT" SECRET-OTHER-FILE
+    [ ! -L "$RUN/request.json" ] || bad "the planted request link should be removed"
+    mkfifo "$RUN/request.json"
+    t0=$SECONDS
+    helper repair-config
+    eq "exit status (fifo request)" 65 "$RC"
+    [ $((SECONDS - t0)) -lt 8 ] || bad "a FIFO request stalled the helper"
+    mkdir "$RUN/request.json"
+    helper repair-config
+    eq "exit status (directory request)" 65 "$RC"
+    { printf '{"operation":"repair-config","job_id":"11111111-2222-4333-8444-555555555555","pad":"'; head -c 5000 /dev/zero | tr '\0' 'x'; printf '"}'; } >"$RUN/request.json"
+    helper repair-config
+    eq "exit status (oversized request)" 65 "$RC"
+    echo '{"job_id":["a"],"operation":"repair-config"}' >"$RUN/request.json"
+    helper repair-config
+    eq "exit status (job_id not a string)" 65 "$RC"
+    eq "work dirs left" 0 "$(find "$STATE" -maxdepth 1 -name '.work.*' | wc -l)"
+}
+
+# e. The helper's override rules are the agent's: printable ASCII only.
+test_hostile_overrides_never_reach_the_config() {
+    {
+        printf '%s\n' \
+            'matchzy_ok 5' \
+            'matchzy_semi 1; rcon_password pwned' \
+            'matchzy_quote 1" ; exec evil "' \
+            'matchzy_demo_upload_url http://evil.example/' \
+            'MATCHZY_DEMO_UPLOAD_URL http://evil.example/' \
+            'Matchzy_Remote_log_url http://evil.example/' \
+            'matchzy_remote_log_url http://evil.example/' \
+            'matchzy_loadmatch_url http://evil.example/' \
+            'matchzy_loadbackup_url http://evil.example/' \
+            'exec evil.cfg' \
+            'alias matchzy_x "quit"' \
+            "// END PORTAL MANAGED — matchzy overrides" \
+            "// END ANSIBLE MANAGED — portal demo upload" \
+            'matchzy_bs 1\' \
+            'matchzy_two_spaces  1' \
+            ' matchzy_leading 1'
+        printf 'matchzy_tab\ta\tb\n'
+        printf 'matchzy_tabval a\tb\n'
+        printf 'matchzy_cr 1\rquit\n'
+        printf 'matchzy_u2028 1\xe2\x80\xa8quit\n'
+        printf 'matchzy_nbsp 1\xc2\xa0quit\n'
+        printf 'matchzy_latin1 caf\xe9\n'
+        printf 'matchzy_del 1\x7f\n'
+        printf 'matchzy_fine a b c $(id) `id` ${HOME} // x\n'
+    } >"$T/etc/matchzy_overrides.cfg"
+    helper repair-config
+    eq "exit status" 0 "$RC"
+    eq "overrides block" "$OVR_BEGIN|matchzy_ok \"5\"|matchzy_two_spaces \" 1\"|matchzy_fine \"a b c \$(id) \`id\` \${HOME} // x\"|$OVR_END|" \
+        "$(sed -n "/^\/\/ BEGIN PORTAL/,/^\/\/ END PORTAL/p" "$CFG" | tr '\n' '|')"
+    eq "one END marker for each block" '1 1' "$(grep -c "^$OVR_END" "$CFG") $(grep -c "^$DEMO_END" "$CFG")"
+    eq "non-ASCII bytes in the block" 0 "$(sed -n "/^\/\/ BEGIN PORTAL/,/^\/\/ END PORTAL/p" "$CFG" | sed '1d;$d' | LC_ALL=C grep -c '[^ -~]')"
+    cfg_eq .overrides_applied false
+    [[ $(jq -r .reason "$RUN/config.json") == '21 line(s) of the MatchZy overrides file were rejected'* ]] || bad "reason: $(jq -r .reason "$RUN/config.json")"
+    cfg_eq .demo_upload_wired true
+    # 64 is the limit; the 65th is dropped and reported.
+    for i in $(seq 1 65); do echo "matchzy_cvar_$i $i"; done >"$T/etc/matchzy_overrides.cfg"
+    helper repair-config
+    eq "override lines" 64 "$(grep -c '^matchzy_cvar_' "$CFG")"
+    cfg_eq .overrides_applied false
+    # Limits: 128-byte names and 256-byte values pass, one more does not.
+    {
+        echo "matchzy_$(head -c 120 /dev/zero | tr '\0' a) 1"
+        echo "matchzy_$(head -c 121 /dev/zero | tr '\0' b) 1"
+        echo "matchzy_v256 $(head -c 256 /dev/zero | tr '\0' x)"
+        echo "matchzy_v257 $(head -c 257 /dev/zero | tr '\0' y)"
+    } >"$T/etc/matchzy_overrides.cfg"
+    helper repair-config
+    eq "accepted at the limits" 2 "$(sed -n "/^\/\/ BEGIN PORTAL/,/^\/\/ END PORTAL/p" "$CFG" | grep -c '^matchzy_')"
+    hasnt "$CFG" matchzy_v257
+    hasnt "$CFG" bbbbbbbbbb
+}
+
+# d. AUTO_REPAIR is the operator's switch; the helper passes it on.
+test_auto_repair_switch_is_exposed() {
+    helper verify-config
+    cfg_eq .auto_repair true
+    echo 'AUTO_REPAIR=false' >>"$T/etc/gs-update.conf"
+    helper verify-config
+    cfg_eq .auto_repair false
+    sed -i 's/^AUTO_REPAIR=.*/AUTO_REPAIR=maybe/' "$T/etc/gs-update.conf"
+    helper verify-config
+    eq "exit status (bad value)" 78 "$RC"
+}
+
+# h. Half a block is removed with the stale token line it held; writes are
+#    by rename; gameinfo backups are bounded.
+test_half_blocks_are_removed_with_their_contents() {
+    # BEGIN without END (a truncated write), stale token inside.
+    printf '%s\n' 'matchzy_a 1' "$DEMO_BEGIN" '// Written by portal-server-agent enroll.' \
+        'matchzy_demo_upload_url "https://old.example/"' \
+        'matchzy_demo_upload_header_value "Bearer OLD-STALE-TOKEN"' 'matchzy_b 2' >"$CFG"
+    helper repair-config
+    eq "exit status" 0 "$RC"
+    hasnt "$CFG" OLD-STALE-TOKEN
+    hasnt "$CFG" old.example
+    has "$CFG" 'matchzy_a 1'
+    has "$CFG" 'matchzy_b 2'
+    eq "markers" '1 1' "$(grep -c "^$DEMO_BEGIN" "$CFG") $(grep -c "^$DEMO_END" "$CFG")"
+    eq "token lines" 1 "$(grep -c header_value "$CFG")"
+    cfg_eq .demo_upload_wired true
+    blockinfile_converge "$CFG" "$T/etc/matchzy_portal.cfg" >"$T/converged.cfg"
+    cmp -s "$T/converged.cfg" "$CFG" || bad "an Ansible blockinfile converge would change the file"
+
+    # END without BEGIN, stale token right before it.
+    printf '%s\n' 'matchzy_a 1' 'matchzy_demo_upload_url "https://old.example/"' \
+        'matchzy_demo_upload_header_value "Bearer OLD-STALE-TOKEN"' "$DEMO_END" 'matchzy_b 2' >"$CFG"
+    helper repair-config
+    hasnt "$CFG" OLD-STALE-TOKEN
+    hasnt "$CFG" old.example
+    has "$CFG" 'matchzy_a 1'
+    has "$CFG" 'matchzy_b 2'
+    eq "markers" '1 1' "$(grep -c "^$DEMO_BEGIN" "$CFG") $(grep -c "^$DEMO_END" "$CFG")"
+    cfg_eq .demo_upload_wired true
+
+    # Two blocks, CRLF file: one block left, operator lines intact, stable.
+    printf 'a 1\r\n%s\r\nx 1\r\n%s\r\nb 2\r\n%s\r\nold 2\r\n%s\r\n' "$DEMO_BEGIN" "$DEMO_END" "$DEMO_BEGIN" "$DEMO_END" >"$CFG"
+    helper repair-config
+    eq "markers" '1 1' "$(grep -c "^$DEMO_BEGIN" "$CFG") $(grep -c "^$DEMO_END" "$CFG")"
+    hasnt "$CFG" 'old 2'
+    has "$CFG" 'b 2'
+    cp "$CFG" "$T/first"
+    helper repair-config
+    st_eq .config_changed false
+    cmp -s "$T/first" "$CFG" || bad "not stable"
+
+    # A stray overrides END must not take the operator's settings with it.
+    printf '%s\n' 'matchzy_keep_me "1"' "$OVR_END" 'matchzy_b 2' >"$CFG"
+    helper repair-config
+    has "$CFG" 'matchzy_keep_me "1"'
+    eq "stray marker gone" 0 "$(grep -c "^$OVR_END" "$CFG")"
+    hasnt "$RUN/state.json" OLD-STALE-TOKEN
+}
+
+test_config_and_gameinfo_are_replaced_by_rename() {
+    # config.cfg: new inode (rename), mode 0640 whatever it was, no temp left.
+    cp "$FAKE/mods_next/cfg/MatchZy/config.cfg" "$CFG"
+    chmod 0664 "$CFG"
+    local inode
+    inode=$(stat -c %i "$CFG")
+    helper repair-config
+    st_eq .config_changed true
+    eq "config mode" 640 "$(stat -c %a "$CFG")"
+    [ "$(stat -c %i "$CFG")" != "$inode" ] || bad "config.cfg was rewritten in place, not renamed into place"
+    eq "temp files left" 0 "$(find "$CSGO" -name '*.portal-tmp' | wc -l)"
+    # A config that does not exist yet is created 0640.
+    rm "$CFG"
+    helper repair-config
+    eq "created mode" 640 "$(stat -c %a "$CFG")"
+    cfg_eq .demo_upload_wired true
+
+    # gameinfo.gi keeps its mode; old backups are pruned to five.
+    chmod 0600 "$CSGO/gameinfo.gi"
+    local i
+    for i in 1 2 3 4 5 6 7; do touch "$CSGO/gameinfo.gi.bak-2020-01-0$i-000000"; done
+    echo 2000 >"$FAKE/remote_build"
+    touch "$FAKE/strip_gameinfo"
+    inode=$(stat -c %i "$CSGO/gameinfo.gi")
+    helper game
+    eq "exit status" 0 "$RC"
+    eq "gameinfo mode kept" 600 "$(stat -c %a "$CSGO/gameinfo.gi")"
+    [ "$(stat -c %i "$CSGO/gameinfo.gi")" != "$inode" ] || bad "gameinfo.gi was rewritten in place"
+    eq "backups kept" 5 "$(find "$CSGO" -maxdepth 1 -name 'gameinfo.gi.bak-*' | wc -l)"
+    [ ! -e "$CSGO/gameinfo.gi.bak-2020-01-01-000000" ] || bad "the oldest backup should be gone"
+    [ -e "$CSGO/gameinfo.gi.bak-2020-01-07-000000" ] || bad "a recent backup was pruned"
+    eq "temp files left" 0 "$(find "$CSGO" -name '*.portal-tmp' | wc -l)"
 }
 
 # --- runner ------------------------------------------------------------------

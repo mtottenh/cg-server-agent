@@ -47,11 +47,16 @@ assets = [
     ["dist/portal-server-agent.env.example", "etc/portal/portal-server-agent.env.example", "0644"],
     # LinuxGSM update helper (README "Game-server updates"). Root-run through
     # the template unit; the polkit rule is the agent's only privilege.
-    ["dist/portal-gs-update", "usr/sbin/portal-gs-update", "0755"],
-    ["dist/portal-gs-update@.service", "usr/lib/systemd/system/portal-gs-update@.service", "0644"],
-    ["dist/50-portal-gs-update.rules", "usr/share/polkit-1/rules.d/50-portal-gs-update.rules", "0644"],
-    ["dist/portal-gs-update.tmpfiles.conf", "usr/lib/tmpfiles.d/portal-gs-update.conf", "0644"],
-    ["dist/gs-update.conf.example", "etc/portal/gs-update.conf.example", "0644"],
+    # These live in dist/gs-update/, not beside the agent's unit, so nothing
+    # cargo-deb looks for in the `unit-scripts` directory (dist/) is mistaken
+    # for part of the agent's unit. The tmpfiles source keeps its installed
+    # name: cargo-deb generates a `systemd-tmpfiles --create <source name>`
+    # call for anything installed into tmpfiles.d.
+    ["dist/gs-update/portal-gs-update", "usr/sbin/portal-gs-update", "0755"],
+    ["dist/gs-update/portal-gs-update@.service", "usr/lib/systemd/system/portal-gs-update@.service", "0644"],
+    ["dist/gs-update/50-portal-gs-update.rules", "usr/share/polkit-1/rules.d/50-portal-gs-update.rules", "0644"],
+    ["dist/gs-update/portal-gs-update.conf", "usr/lib/tmpfiles.d/portal-gs-update.conf", "0644"],
+    ["dist/gs-update/gs-update.conf.example", "etc/portal/gs-update.conf.example", "0644"],
 ]
 # postinst creates the portal-agent user and seeds the env file; without
 # this cargo-deb ships the unit with no user behind it and the service can

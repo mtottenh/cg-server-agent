@@ -16,3 +16,7 @@ MATCHZY_CONFIG_OWNER=cs2server
 # SNAPSHOT_KEEP=3       plugin snapshots kept in /var/lib/portal-gs-update/snapshots
 # VERIFY_TIMEOUT=90     seconds to wait for the plugin stack to load after a start
 # APPMANIFEST_PATH=     default: <serverfiles>/steamapps/appmanifest_730.acf
+# AUTO_REPAIR=true      may the agent run `repair-config` on its own when the
+#                       managed MatchZy config blocks are missing (it restarts
+#                       nothing; the config is re-read only while no match is
+#                       loaded). false: it only reports, an admin clicks Repair.

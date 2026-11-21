@@ -8,6 +8,9 @@ case "$1" in
         # itself is left alone in case anything else uses it on this host.
         rm -f /etc/portal/portal-server-agent.env
         rm -rf /etc/portal/agent
+        # Update helper state (snapshots included) and the agent's own.
+        # /etc/portal/gs-update.conf belongs to configuration management.
+        rm -rf /var/lib/portal-gs-update /run/portal-gs-update /var/lib/portal-server-agent
         rmdir /etc/portal 2>/dev/null || true
         if getent passwd portal-agent >/dev/null; then
             deluser --quiet --system portal-agent || true

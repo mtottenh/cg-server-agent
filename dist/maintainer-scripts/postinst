@@ -1,8 +1,9 @@
 #!/bin/sh
 set -e
 
-# cargo-deb injects dh_installsystemd-style snippets below the #DEBHELPER#
-# marker for enabling the unit (start = false in Cargo.toml — the service
+# cargo-deb injects dh_installsystemd-style snippets at the debhelper marker
+# on the last line (the token must appear exactly ONCE in this file — every
+# occurrence is replaced, comments included) for enabling the unit (start = false in Cargo.toml — the service
 # is useless until `enroll` has run and the env file is filled in).
 # Everything above is our own setup: user, directories, conf file.
 
@@ -31,6 +32,16 @@ case "$1" in
             chown root:portal-agent /etc/portal/portal-server-agent.env
             chmod 0640 /etc/portal/portal-server-agent.env
             echo "portal-server-agent: seeded /etc/portal/portal-server-agent.env from example — edit, enroll, then systemctl start portal-server-agent"
+        fi
+
+        # Update helper: persistent state (last check, installed versions,
+        # plugin snapshots — those hold the MatchZy config, so 0700) and the
+        # runtime directory it shares with the agent. tmpfiles needs the
+        # portal-agent group, created above.
+        install -d -o root -g root -m 0755 /var/lib/portal-gs-update
+        install -d -o root -g root -m 0700 /var/lib/portal-gs-update/snapshots
+        if command -v systemd-tmpfiles >/dev/null 2>&1; then
+            systemd-tmpfiles --create /usr/lib/tmpfiles.d/portal-gs-update.conf || true
         fi
 
         # If `enroll` ran before the package was (re)installed, make sure the

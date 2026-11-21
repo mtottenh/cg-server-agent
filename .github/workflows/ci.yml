@@ -35,3 +35,36 @@ jobs:
         run: |
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
+
+  # The LinuxGSM update helper (dist/gs-update/portal-gs-update) against a fake game
+  # tree and a fake LinuxGSM script: no root, no network.
+  helper-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends jq zstd curl python3 procps shellcheck
+
+      - name: shellcheck
+        run: shellcheck --severity=warning dist/gs-update/portal-gs-update tests/helper/run.sh tests/helper/fake-lgsm.sh
+
+      - name: Helper tests
+        run: tests/helper/run.sh
+
+      - name: Unit files parse
+        run: |
+          systemd-analyze verify "dist/gs-update/portal-gs-update@.service" 2>&1 | tee verify.log
+          # Only the missing binary is expected on a runner without the deb.
+          if grep -v 'is not executable' verify.log | grep -i 'portal-gs-update'; then
+            exit 1
+          fi
+
+      # The harness and the helper are run directly: they must be committed
+      # executable (a checkout with core.fileMode=false hides a lost bit).
+      - name: Scripts are executable in the index
+        run: |
+          for f in dist/gs-update/portal-gs-update tests/helper/run.sh tests/helper/fake-lgsm.sh; do
+            test "$(git ls-files -s "$f" | cut -c1-6)" = 100755 || { echo "::error::$f is not 100755"; exit 1; }
+          done

@@ -1,0 +1,1804 @@
+#!/usr/bin/env bash
+# portal-gs-update — the only thing on a game host that drives LinuxGSM.
+#
+#   portal-gs-update [--unit] check | lgsm | game | mods | all | repair-config
+#   portal-gs-update verify-config
+#
+# `--unit` is passed by portal-gs-update@.service and by nothing else: only
+# then is /run/portal-gs-update/request.json (the agent's job id for THIS
+# start) looked at. A run from cron or by hand never adopts a request that a
+# failed unit start left behind.
+#
+# `verify-config` is not a job: it only reads the MatchZy config and writes
+# /run/portal-gs-update/config.json (is demo upload wired, are the portal's
+# overrides applied). It never touches state.json and steps aside (exit 75,
+# silently) when a job holds the lock; every job refreshes config.json itself
+# when it ends.
+#
+# Runs as root: from portal-gs-update@<op>.service (started by the agent
+# through polkit), from the nightly cron (`portal-gs-update game`) or by hand
+# over SSH. Each operation is one transaction under a single flock and writes
+# its progress to a state file the agent relays to the portal.
+#
+# Design: docs/gameserver-lgsm-updates-design.md §4-§5 (portal repo).
+#
+# Trust boundaries, because this is root code reading other users' files:
+#   * The game tree belongs to LGSM_USER. Everything read from or written to
+#     it happens AS that user (runuser), so a symlink planted there can never
+#     make root read or clobber a file the game user could not touch itself.
+#   * /etc/portal/agent belongs to the agent user. The snippet and overrides
+#     are read AS the agent user, in one open that refuses a symlink, cannot
+#     block on a FIFO and stops at a size cap; the overrides are re-validated
+#     here (the agent validates too; this copy is the one that counts).
+#   * /run/portal-gs-update is group-writable by the agent (it drops
+#     request.json there). It is sticky. Root never reads a name in it:
+#     request.json is read as the agent user like the files above; the lock
+#     must be a root-owned regular file; state.json and config.json are
+#     written from root-private copies with mktemp + rename, after removing
+#     anything at those names that is not root's own regular file.
+#   * Nothing from the portal reaches a shell: the operation is one word from
+#     a closed list, the job id is matched against a strict pattern.
+#
+# Exit codes: 0 succeeded, 1 failed, 3 rolled back, 64 usage, 65 bad request
+# file, 69 missing dependency, 75 another operation holds the lock, 78 not
+# configured (no /etc/portal/gs-update.conf — how non-LGSM hosts opt out).
+#
+# Test/dev overrides (environment; the systemd unit passes none):
+#   GS_UPDATE_CONF, GS_UPDATE_RUN_DIR, GS_UPDATE_STATE_DIR, GS_UPDATE_SNIPPET,
+#   GS_UPDATE_OVERRIDES, GS_UPDATE_LGSM_DIRECT=1 (no runuser: run LGSM and
+#   touch the tree as the current user), GS_UPDATE_AGENT_USER,
+#   GS_UPDATE_GITHUB_API, GS_UPDATE_MMS_URL, GS_UPDATE_VERIFY_POLL,
+#   GS_UPDATE_PUMP_INTERVAL, GS_UPDATE_LGSM_TIMEOUT (one bound for every
+#   LinuxGSM command), GS_UPDATE_LOCK_WAIT, GS_UPDATE_CACHE_TTL,
+#   GS_UPDATE_NO_SYSLOG=1, GS_UPDATE_FORCE=1 (game/all: `force-update`
+#   instead of `update`).
+
+set -uo pipefail
+umask 022
+# Bytes, not characters: console output and config files are not reliably
+# UTF-8, and a pattern that silently skips an invalid byte is how a secret
+# gets past a redaction. Nothing here needs to know about characters.
+export LC_ALL=C
+
+readonly PROG=portal-gs-update
+readonly EX_FAILED=1 EX_ROLLED_BACK=3 EX_USAGE=64 EX_BADREQ=65 EX_DEP=69 EX_BUSY=75 EX_CONFIG=78
+
+CONF=${GS_UPDATE_CONF:-/etc/portal/gs-update.conf}
+RUN_DIR=${GS_UPDATE_RUN_DIR:-/run/portal-gs-update}
+STATE_DIR=${GS_UPDATE_STATE_DIR:-/var/lib/portal-gs-update}
+SNIPPET=${GS_UPDATE_SNIPPET:-/etc/portal/agent/matchzy_portal.cfg}
+OVERRIDES=${GS_UPDATE_OVERRIDES:-/etc/portal/agent/matchzy_overrides.cfg}
+DIRECT=${GS_UPDATE_LGSM_DIRECT:-0}
+GITHUB_API=${GS_UPDATE_GITHUB_API:-https://api.github.com}
+MMS_LATEST_URL=${GS_UPDATE_MMS_URL:-https://mms.alliedmods.net/mmsdrop/2.0/mmsource-latest-linux}
+VERIFY_POLL=${GS_UPDATE_VERIFY_POLL:-2}
+PUMP_INTERVAL=${GS_UPDATE_PUMP_INTERVAL:-1}
+LGSM_TIMEOUT=${GS_UPDATE_LGSM_TIMEOUT:-}
+LOCK_WAIT=${GS_UPDATE_LOCK_WAIT:-30}
+AGENT_USER=${GS_UPDATE_AGENT_USER:-portal-agent}
+CACHE_TTL=${GS_UPDATE_CACHE_TTL:-600}
+FORCE=${GS_UPDATE_FORCE:-0}
+
+# A request file older than this was meant for a helper that never ran.
+readonly REQUEST_MAX_AGE=60
+# No read from the game tree may hang (a FIFO where a file should be) or
+# swallow something huge.
+readonly TREE_READ_TIMEOUT=20 TREE_FILE_MAX=1048576 CONSOLE_MAX=67108864
+readonly LOG_TAIL_BYTES=4096
+readonly MM_MARKER='csgo/addons/metamod'
+
+# Identical to the Ansible blockinfile task in roles/gameserver_agent (em
+# dash included), so a later converge finds its own block and changes nothing.
+readonly DEMO_BEGIN='// BEGIN ANSIBLE MANAGED — portal demo upload'
+readonly DEMO_END='// END ANSIBLE MANAGED — portal demo upload'
+readonly OVR_BEGIN='// BEGIN PORTAL MANAGED — matchzy overrides'
+readonly OVR_END='// END PORTAL MANAGED — matchzy overrides'
+
+# Set by load_conf.
+LGSM_SCRIPT='' LGSM_USER='' GAMEINFO_PATH='' CONSOLE_LOG=''
+MATCHZY_CONFIG_PATH='' MATCHZY_CONFIG_OWNER=''
+SNAPSHOT_KEEP=3 VERIFY_TIMEOUT=90 AUTO_REPAIR=true
+CSGO_DIR='' APPMANIFEST='' MZ_REL='' CFG_USER=''
+
+OP='' JOB_ID='' TRIGGER=local
+WORK='' LOG_FILE=/dev/null
+STATE_OPEN=0 FINISHED=0 PUBLISH_FAILED=0
+USE_LOGGER=0
+# What an interrupted job has to put right (see on_exit):
+#   none     nothing
+#   down     this job stopped the server (or LinuxGSM may have); plugin files
+#            are untouched
+#   dirty    plugin files may be half-updated
+#   started  the server was started again; verification had not finished
+#   maybe    LinuxGSM's own `update` was running: it stops and restarts the
+#            server itself, but only when there is an update
+TX_STAGE=none RECOVERY_NOTE='' RESTORE_NOTE=''
+UNIT=0
+
+usage() {
+    echo "usage: $PROG [--unit] check|lgsm|game|mods|all|repair-config|verify-config" >&2
+    exit "$EX_USAGE"
+}
+
+# --- output -----------------------------------------------------------------
+
+# Strip ANSI colour and carriage-return progress redraws, then drop every
+# line that could carry a secret. Applied to everything that reaches the log,
+# the journal or the state file.
+sanitize() {
+    # LC_ALL=C and a whole-line replacement (`c`): `s/.*/…/` stops at a byte
+    # that is not valid in the locale and would leave the rest of the line.
+    LC_ALL=C sed -u -E \
+        -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' \
+        -e 's/\r+$//' \
+        -e 's/.*\r//' \
+        -e '/matchzy_demo_upload_header_value|rcon_password|sv_password|tv_password|Bearer /Ic\[redacted line]'
+}
+
+# Log lines go to fd 3 (the real stdout), not fd 1, so a function that logs
+# can still be used inside $(...).
+exec 3>&1
+emit() {
+    if [ "$USE_LOGGER" = 1 ]; then
+        tee -a "$LOG_FILE" | tee >(logger -t "$PROG" 2>/dev/null) >&3
+    else
+        tee -a "$LOG_FILE" >&3
+    fi
+}
+
+log() {
+    printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | sanitize | emit
+}
+
+die() { # die <exit code> <message> — before any state exists
+    echo "$PROG: $2" >&2
+    exit "$1"
+}
+
+# --- configuration ----------------------------------------------------------
+
+load_conf() {
+    if [ ! -f "$CONF" ]; then
+        die "$EX_CONFIG" "$CONF not found — this host is not configured for LinuxGSM updates"
+    fi
+    local line key val
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+        if [[ $line =~ ^[[:space:]]*([A-Z_]+)=(.*)$ ]]; then
+            key=${BASH_REMATCH[1]}
+            val=${BASH_REMATCH[2]}
+            # KEY=value, KEY="value" or KEY='value'; never evaluated.
+            if [[ $val =~ ^\"(.*)\"[[:space:]]*$ ]] || [[ $val =~ ^\'(.*)\'[[:space:]]*$ ]]; then
+                val=${BASH_REMATCH[1]}
+            else
+                val=${val%"${val##*[![:space:]]}"}
+            fi
+            case $key in
+                LGSM_SCRIPT) LGSM_SCRIPT=$val ;;
+                LGSM_USER) LGSM_USER=$val ;;
+                GAMEINFO_PATH) GAMEINFO_PATH=$val ;;
+                CONSOLE_LOG) CONSOLE_LOG=$val ;;
+                MATCHZY_CONFIG_PATH) MATCHZY_CONFIG_PATH=$val ;;
+                MATCHZY_CONFIG_OWNER) MATCHZY_CONFIG_OWNER=$val ;;
+                SNAPSHOT_KEEP) SNAPSHOT_KEEP=$val ;;
+                VERIFY_TIMEOUT) VERIFY_TIMEOUT=$val ;;
+                AUTO_REPAIR) AUTO_REPAIR=$val ;;
+                APPMANIFEST_PATH) APPMANIFEST=$val ;;
+                *) echo "$PROG: ignoring unknown key $key in $CONF" >&2 ;;
+            esac
+        else
+            die "$EX_CONFIG" "$CONF: malformed line (expected KEY=VALUE)"
+        fi
+    done <"$CONF"
+
+    local k
+    for k in LGSM_SCRIPT LGSM_USER GAMEINFO_PATH CONSOLE_LOG MATCHZY_CONFIG_PATH MATCHZY_CONFIG_OWNER; do
+        [ -n "${!k}" ] || die "$EX_CONFIG" "$CONF: $k is required"
+    done
+    for k in LGSM_SCRIPT GAMEINFO_PATH CONSOLE_LOG MATCHZY_CONFIG_PATH; do
+        [[ ${!k} == /* ]] || die "$EX_CONFIG" "$CONF: $k must be an absolute path"
+    done
+    [[ $LGSM_USER =~ ^[a-z_][a-z0-9_-]*$ ]] || die "$EX_CONFIG" "$CONF: LGSM_USER is not a valid user name"
+    [[ $MATCHZY_CONFIG_OWNER =~ ^[a-z_][a-z0-9_-]*(:[a-z_][a-z0-9_-]*)?$ ]] \
+        || die "$EX_CONFIG" "$CONF: MATCHZY_CONFIG_OWNER is not a valid owner"
+    [[ $SNAPSHOT_KEEP =~ ^[1-9][0-9]?$ ]] || die "$EX_CONFIG" "$CONF: SNAPSHOT_KEEP must be 1-99"
+    [[ $VERIFY_TIMEOUT =~ ^[1-9][0-9]{0,3}$ ]] || die "$EX_CONFIG" "$CONF: VERIFY_TIMEOUT must be 1-9999 seconds"
+    [[ $AUTO_REPAIR =~ ^(true|false)$ ]] || die "$EX_CONFIG" "$CONF: AUTO_REPAIR must be true or false"
+
+    CFG_USER=${MATCHZY_CONFIG_OWNER%%:*}
+    # gameinfo.gi lives in <serverfiles>/game/csgo/.
+    CSGO_DIR=$(dirname "$GAMEINFO_PATH")
+    [ -n "$APPMANIFEST" ] || APPMANIFEST="$(dirname "$(dirname "$CSGO_DIR")")/steamapps/appmanifest_730.acf"
+    local mz_dir
+    mz_dir=$(dirname "$MATCHZY_CONFIG_PATH")
+    case $mz_dir in
+        "$CSGO_DIR"/*) MZ_REL=${mz_dir#"$CSGO_DIR"/} ;;
+        *) die "$EX_CONFIG" "$CONF: MATCHZY_CONFIG_PATH must be inside $(printf '%s' "$CSGO_DIR")" ;;
+    esac
+}
+
+check_deps() {
+    local c
+    for c in jq flock tar sha256sum awk sed timeout setsid dd; do
+        command -v "$c" >/dev/null 2>&1 || die "$EX_DEP" "required command not found: $c"
+    done
+    if [ "$DIRECT" != 1 ]; then
+        command -v runuser >/dev/null 2>&1 || die "$EX_DEP" "required command not found: runuser"
+    fi
+}
+
+# --- privilege drops --------------------------------------------------------
+
+as_user() { # as_user <user> <command...>
+    local u=$1
+    shift
+    # 9<&-: a child must never inherit the lock (a daemonising one, like
+    # the tmux server LinuxGSM starts, would hold it forever).
+    if [ "$DIRECT" = 1 ]; then
+        "$@" 9<&-
+    else
+        runuser -u "$u" -- "$@" 9<&-
+    fi
+}
+as_gs() { as_user "$LGSM_USER" "$@"; }
+as_cfg() { as_user "$CFG_USER" "$@"; }
+
+as_user_t() { # as_user_t <seconds> <user> <command...> — as_user with a time limit
+    local t=$1 u=$2
+    shift 2
+    if [ "$DIRECT" = 1 ]; then
+        timeout "$t" "$@" 9<&-
+    else
+        timeout "$t" runuser -u "$u" -- "$@" 9<&-
+    fi
+}
+
+# Copy a file from the game tree, read as its user, into <out>. It must be a
+# regular file (a FIFO there would block whoever opens it — and with it the
+# lock, for as long as the unit may run), the read is time-limited, and a
+# file over <max> bytes is an error rather than silently cut short.
+read_tree() { # read_tree <user> <path> <max bytes> <out>
+    local u=$1 path=$2 max=$3 out=$4
+    as_user "$u" test -f "$path" || return 1
+    as_user_t "$TREE_READ_TIMEOUT" "$u" head -c "$((max + 1))" -- "$path" >"$out" 2>/dev/null || return 1
+    [ "$(stat -c %s -- "$out")" -le "$max" ]
+}
+
+# Print a file that the agent user can write (the enrollment snippet, the
+# overrides, request.json). Root never opens it: it is read as the agent
+# user, in ONE open that refuses a symlink (nofollow), cannot hang on a FIFO
+# (nonblock, and a timeout), and takes at most max+1 bytes — one more than
+# the cap, so "too big" is decided on what was actually read, not on a stat
+# of something that may since have been swapped.
+read_untrusted() { # read_untrusted <path> <max bytes> → stdout; 1 if absent/unsafe/too big
+    local path=$1 max=$2 out size rc=0
+    # A first filter only (a stat, and it can be raced): what makes the read
+    # safe is the open below. It does tell a FIFO, which would read as an
+    # empty file, from a file that really is empty.
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    out=$(mktemp "$WORK/untrusted.XXXXXX") || return 1
+    if [ "$DIRECT" = 1 ]; then
+        timeout 5 dd if="$path" iflag=nofollow,nonblock bs="$((max + 1))" count=1 status=none >"$out" 2>/dev/null 9<&- || rc=$?
+    else
+        timeout 5 runuser -u "$AGENT_USER" -- dd if="$path" iflag=nofollow,nonblock bs="$((max + 1))" count=1 status=none >"$out" 2>/dev/null 9<&- || rc=$?
+    fi
+    size=$(stat -c %s -- "$out")
+    if [ "$rc" -ne 0 ] || [ "$size" -gt "$max" ]; then
+        rm -f -- "$out"
+        return 1
+    fi
+    cat -- "$out"
+    rm -f -- "$out"
+}
+
+# --- lock, request, state ---------------------------------------------------
+
+ensure_dirs() {
+    if [ ! -d "$RUN_DIR" ]; then
+        mkdir -p "$RUN_DIR" || die "$EX_FAILED" "cannot create $RUN_DIR"
+        chmod 0755 "$RUN_DIR"
+    fi
+    mkdir -p "$STATE_DIR/snapshots" || die "$EX_FAILED" "cannot create $STATE_DIR/snapshots"
+    chmod 0700 "$STATE_DIR/snapshots"
+}
+
+# The run directory is writable by the agent's group. Before root uses a
+# name in it: a link, a FIFO, a directory or a file root does not own was not
+# put there by this helper. Remove it; never open it.
+run_dir_claim() { # run_dir_claim <path>
+    if [ -L "$1" ] || { [ -e "$1" ] && { [ ! -f "$1" ] || [ ! -O "$1" ]; }; }; then
+        rm -rf -- "$1"
+    fi
+}
+
+make_work() { # root-private scratch space; removed by on_exit
+    WORK=$(mktemp -d "$STATE_DIR/.work.XXXXXX") || die "$EX_FAILED" "cannot create a work directory in $STATE_DIR"
+    chmod 0700 "$WORK"
+}
+
+# A job waits for the lock (a verify-config, which takes it for a moment,
+# must not make a job fail); verify-config itself never waits.
+acquire_lock() { # acquire_lock [quiet] — quiet: do not wait, no message when held
+    local lock="$RUN_DIR/lock"
+    run_dir_claim "$lock"
+    if [ ! -e "$lock" ]; then
+        # noclobber = O_EXCL: never creates through a link that raced in.
+        (set -o noclobber && : >"$lock") 2>/dev/null || true
+    fi
+    if [ -L "$lock" ] || [ ! -f "$lock" ] || [ ! -O "$lock" ]; then
+        die "$EX_FAILED" "cannot create a safe lock file at $lock"
+    fi
+    exec 9<"$lock" || die "$EX_FAILED" "cannot open $lock"
+    if [ "${1:-}" = quiet ]; then
+        flock -n 9 || exit "$EX_BUSY"
+    elif ! flock -w "$LOCK_WAIT" 9; then
+        die "$EX_BUSY" "another $PROG operation is running (lock still held after ${LOCK_WAIT}s)"
+    fi
+}
+
+new_uuid() {
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+    else
+        uuidgen | tr 'A-F' 'a-f'
+    fi
+}
+
+# The agent drops {"job_id","operation"[,"trigger"]} just before starting the
+# unit so the portal's job id travels without ever being an argument.
+read_request() {
+    local req="$RUN_DIR/request.json" copy="$WORK/request.json" age rop rid rtrig created
+    if [ "$UNIT" = 1 ] && { [ -e "$req" ] || [ -L "$req" ]; }; then
+        if ! read_untrusted "$req" 4096 >"$copy" 2>/dev/null \
+            || ! rop=$(jq -er '.operation | strings' "$copy" 2>/dev/null); then
+            # A link, a FIFO, a directory, too big, or not JSON.
+            rm -rf -- "$req"
+            die "$EX_BADREQ" "request file is not a small regular JSON file with an operation"
+        fi
+        # The agent stamps the request when it starts the unit. One that is
+        # not from the last minute was for a start that never happened.
+        created=$(jq -r '.created_at | numbers | floor' "$copy" 2>/dev/null)
+        [[ $created =~ ^[0-9]{1,12}$ ]] || created=0
+        age=$(($(date +%s) - created))
+        if [ "$age" -gt "$REQUEST_MAX_AGE" ] || [ "$age" -lt "-$REQUEST_MAX_AGE" ]; then
+            rm -rf -- "$req"
+            echo "$PROG: discarded a stale request file" >&2
+        elif [ "$rop" != "$OP" ]; then
+            # Fresh but for another operation: it belongs to a unit that is
+            # about to run (or is waiting for the lock). Leave it alone.
+            echo "$PROG: request file is for another operation; ignoring it" >&2
+        else
+            rid=$(jq -r '.job_id | strings' "$copy" 2>/dev/null)
+            rtrig=$(jq -r '.trigger | strings' "$copy" 2>/dev/null)
+            rm -f -- "$req"
+            [[ $rid =~ ^[0-9a-f-]{36}$ ]] || die "$EX_BADREQ" "request file has an invalid job_id"
+            JOB_ID=$rid
+            case $rtrig in
+                portal | auto_repair | overrides) TRIGGER=$rtrig ;;
+                *) TRIGGER=portal ;;
+            esac
+        fi
+    fi
+    rm -f -- "$copy"
+    if [ -z "$JOB_ID" ]; then
+        JOB_ID=$(new_uuid)
+    fi
+    [[ $JOB_ID =~ ^[0-9a-f-]{36}$ ]] || die "$EX_FAILED" "could not generate a job id"
+}
+
+now_iso() { date -u +%FT%TZ; }
+
+# The published document is assembled in $WORK/state.pub (root-private) and
+# only then copied into the run directory. Nothing is ever read back from
+# there: last-job.json is made from state.pub too.
+publish() {
+    local tmp='' tail_file="$WORK/tail" pub="$WORK/state.pub" size
+    size=$(stat -c %s -- "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$LOG_TAIL_BYTES" ]; then
+        # Whole lines only: the cut usually lands mid-line.
+        tail -c "$LOG_TAIL_BYTES" "$LOG_FILE" | sed 1d >"$tail_file"
+    else
+        cat "$LOG_FILE" >"$tail_file" 2>/dev/null
+    fi
+    if ! jq --rawfile t "$tail_file" --argjson pf "$([ "$PUBLISH_FAILED" = 1 ] && echo true || echo false)" \
+        '.log_tail = $t | .state_publish_failed = $pf' "$WORK/state.json" >"$pub.new"; then
+        return 1
+    fi
+    mv -f "$pub.new" "$pub"
+    run_dir_claim "$RUN_DIR/state.json"
+    if tmp=$(mktemp "$RUN_DIR/.state.XXXXXX" 2>/dev/null) && cat "$pub" >"$tmp" 2>/dev/null \
+        && chmod 0644 "$tmp" && mv -fT "$tmp" "$RUN_DIR/state.json" 2>/dev/null; then
+        return 0
+    fi
+    [ -z "$tmp" ] || rm -f -- "$tmp"
+    if [ "$PUBLISH_FAILED" = 0 ]; then
+        # Carry on — the job matters more than its progress display — but
+        # say so, in the log and in the record kept in last-job.json.
+        PUBLISH_FAILED=1
+        log "WARNING: cannot publish state.json in $RUN_DIR (full or not writable); the result is still recorded in last-job.json"
+    fi
+    return 1
+}
+
+st() { # st <jq filter> [jq options...] — mutate the working state, publish
+    local filter=$1
+    shift
+    if jq "$@" "$filter" "$WORK/state.json" >"$WORK/state.new"; then
+        mv -f "$WORK/state.new" "$WORK/state.json"
+    else
+        echo "$PROG: internal error: state update failed: $filter" >&2
+    fi
+    publish
+}
+
+phase() {
+    log "== phase: $1"
+    st '.phase = $p' --arg p "$1"
+}
+
+open_state() {
+    LOG_FILE="$WORK/job.log"
+    : >"$LOG_FILE"
+    jq -n --arg job "$JOB_ID" --arg op "$OP" --arg trig "$TRIGGER" --arg at "$(now_iso)" --argjson pid "$$" '{
+        job_id: $job, operation: $op, trigger: $trig, pid: $pid,
+        status: "running", phase: "init",
+        started_at: $at, finished_at: null,
+        failed_phase: null,
+        before: null, after: null, latest: null,
+        load: null, demo_upload_block_present: null,
+        restarted: false, needs_reload: false, config_changed: false,
+        config_report: null, error: null, state_publish_failed: false, log_tail: ""
+    }' >"$WORK/state.json"
+    STATE_OPEN=1
+    publish
+}
+
+atomic_install() { # atomic_install <source> <destination> — 0644, rename into place
+    local tmp
+    tmp=$(mktemp "$2.XXXXXX") || return 1
+    if cat "$1" >"$tmp" && chmod 0644 "$tmp" && mv -fT "$tmp" "$2"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+record_last_job() { # the copy the agent replays if the portal never got the result
+    [ "$OP" != check ] || return 0
+    atomic_install "$WORK/state.pub" "$STATE_DIR/last-job.json" \
+        || echo "$PROG: could not record last-job.json" >&2
+}
+
+finish() { # finish <status> [error] — terminal; never returns
+    local status=$1 error=${2:-} code=0
+    [ -z "$error" ] || log "ERROR: $error"
+    log "== $OP finished: $status"
+    TX_STAGE=none
+    # On success the phase ends at "done"; otherwise it stays where it broke.
+    st '.status = $s | .finished_at = $at
+        | .error = (if $e == "" then null else $e end)
+        | if $s == "succeeded" then .phase = "done"
+          else .failed_phase = (.failed_phase // .phase) end' \
+        --arg s "$status" --arg at "$(now_iso)" --arg e "$(printf '%s' "$error" | sanitize)"
+    FINISHED=1
+    record_last_job
+    # Whatever this job did to the MatchZy config, say where it stands now.
+    write_config_json || echo "$PROG: could not write config.json" >&2
+    case $status in
+        succeeded) code=0 ;;
+        rolled_back) code=$EX_ROLLED_BACK ;;
+        *) code=$EX_FAILED ;;
+    esac
+    exit "$code"
+}
+
+descendants() { # every process below <pid>, as it is right now
+    local c
+    for c in $(cat "/proc/$1/task/$1/children" 2>/dev/null || pgrep -P "$1" 2>/dev/null); do
+        echo "$c"
+        descendants "$c"
+    done
+}
+
+proc_field() { # proc_field <pid> ppid|start — from /proc/<pid>/stat
+    local s
+    s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    s=${s##*) } # the command name may contain anything; fields follow its ")"
+    # shellcheck disable=SC2086  # split into fields
+    set -- "$2" $s
+    case $1 in
+        ppid) echo "${3:-}" ;;
+        start) echo "${21:-}" ;;
+    esac
+}
+
+# Everything a LinuxGSM command has started, noted while it runs: once the
+# command itself is gone its children are orphans and can no longer be found
+# from it. pid → start time, so a recycled pid is never mistaken for one.
+declare -A TREE=()
+tree_note() { # tree_note <pid>
+    local p
+    for p in $(descendants "$1"); do
+        [ -n "${TREE[$p]:-}" ] || TREE[$p]=$(proc_field "$p" start)
+    done
+}
+
+under_tmux() { # is <pid> a tmux server, or running inside one
+    local p=$1 n=0
+    while [ -n "$p" ] && [ "$p" -gt 1 ] && [ "$n" -lt 32 ]; do
+        case $(cat "/proc/$p/comm" 2>/dev/null) in tmux*) return 0 ;; esac
+        p=$(proc_field "$p" ppid) || return 1
+        n=$((n + 1))
+    done
+    return 1
+}
+
+# Stop what is left of the noted tree: SteamCMD or a mod installer that
+# outlived its LinuxGSM command (`timeout` signals runuser, runuser signals
+# only its direct child, which is in a session of its own). Never the game
+# server: LinuxGSM runs it inside a tmux server, and anything that is one or
+# sits under one is left alone.
+tree_kill() {
+    local p sig sent n
+    for sig in TERM KILL; do
+        sent=0
+        for p in "${!TREE[@]}"; do
+            [ -n "${TREE[$p]}" ] && [ "$(proc_field "$p" start)" = "${TREE[$p]}" ] || continue
+            under_tmux "$p" && continue
+            kill "-$sig" "$p" 2>/dev/null && sent=1
+        done
+        [ "$sent" = 1 ] && [ "$sig" = TERM ] || break
+        log "stopping processes the LinuxGSM command left behind"
+        n=0
+        while [ "$n" -lt 20 ]; do
+            sent=0
+            for p in "${!TREE[@]}"; do
+                if [ "$(proc_field "$p" start)" = "${TREE[$p]}" ] && ! under_tmux "$p"; then sent=1; fi
+            done
+            [ "$sent" = 1 ] || break
+            sleep 0.25
+            n=$((n + 1))
+        done
+    done
+    TREE=()
+}
+
+# Stop the LinuxGSM command this helper is running and everything below it,
+# so nothing of the job keeps working on the game tree once the lock is
+# released.
+kill_child() {
+    [ -n "$CHILD_PID" ] || return 0
+    local n=0
+    tree_note "$CHILD_PID"
+    kill -TERM -- "-$CHILD_PID" 2>/dev/null || kill -TERM "$CHILD_PID" 2>/dev/null
+    while kill -0 "$CHILD_PID" 2>/dev/null && [ "$n" -lt 40 ]; do
+        sleep 0.25
+        n=$((n + 1))
+    done
+    kill -KILL -- "-$CHILD_PID" 2>/dev/null
+    wait "$CHILD_PID" 2>/dev/null
+    CHILD_PID=''
+    tree_kill
+}
+
+# An interrupted job must not leave the server down, or up on half-updated
+# plugin files. Put back what this job took apart; say what was done.
+# After a `start` issued without knowing whether the server was down: was it
+# running all along? LinuxGSM says so; failing that, a start that really
+# happened shows in the console log (rotated, or written to) within seconds.
+start_was_noop() {
+    local n=0 inode size
+    grep -qi 'already running' "$WORK/lgsm.out" 2>/dev/null && return 0
+    while [ "$n" -lt 20 ]; do
+        inode=$(as_gs stat -c %i -- "$CONSOLE_LOG" 2>/dev/null || echo 0)
+        size=$(as_gs stat -c %s -- "$CONSOLE_LOG" 2>/dev/null || echo 0)
+        if [ "$inode" != "$MARK_INODE" ] || [ "$size" != "$MARK_OFF" ]; then
+            return 1
+        fi
+        sleep 0.25
+        n=$((n + 1))
+    done
+    return 0
+}
+
+recover_interrupted() {
+    RECOVERY_NOTE='nothing needed putting back'
+    case $TX_STAGE in
+        none) return 0 ;;
+        started)
+            RECOVERY_NOTE='the server had been started again; verification did not finish'
+            return 0
+            ;;
+        maybe) log "recovering: LinuxGSM's update was interrupted; making sure the server is up" ;;
+        *) log "recovering: the job was interrupted with the server stopped (stage: $TX_STAGE)" ;;
+    esac
+    if [ "$TX_STAGE" = dirty ]; then
+        phase rollback
+        run_lgsm stop || true
+        if snapshot_restore; then
+            RECOVERY_NOTE="plugin files restored from ${SNAP##*/}"
+            reconcile_config || log "WARNING: could not re-assert the managed config blocks after restore"
+            st '.config_report = null | .config_changed = false'
+        else
+            RECOVERY_NOTE="restoring ${SNAP##*/} FAILED ($RESTORE_NOTE)"
+        fi
+    else
+        RECOVERY_NOTE='plugin files were not touched'
+    fi
+    gameinfo_assert || log "WARNING: could not assert the Metamod search path"
+    console_mark
+    if run_lgsm start; then
+        if [ "$TX_STAGE" = maybe ] && start_was_noop; then
+            # Nothing was restarted, so there is nothing to verify — and no
+            # load lines to wait for.
+            RECOVERY_NOTE="$RECOVERY_NOTE; the server was still running and was left as it is"
+            return 0
+        fi
+        st '.restarted = true'
+        if verify_stack; then
+            RECOVERY_NOTE="$RECOVERY_NOTE; server started and the plugin stack loaded"
+        else
+            RECOVERY_NOTE="$RECOVERY_NOTE; server started but: $VERIFY_ERR"
+        fi
+    elif [ "$TX_STAGE" = maybe ] && start_was_noop; then
+        RECOVERY_NOTE="$RECOVERY_NOTE; the server was still running and was left as it is"
+    else
+        RECOVERY_NOTE="$RECOVERY_NOTE; starting the server FAILED - it is down"
+    fi
+}
+
+on_exit() {
+    local rc=$? at
+    # Recovery below must not be cut short by a second signal. (The signal
+    # traps already ignore further ones before they get here; this covers an
+    # exit that was not caused by a signal.)
+    trap '' TERM INT HUP
+    kill_child
+    if [ "$STATE_OPEN" = 1 ] && [ "$FINISHED" != 1 ]; then
+        FINISHED=1
+        at=$(jq -r .phase "$WORK/state.json" 2>/dev/null)
+        log "ERROR: helper interrupted (status $rc) during phase $at"
+        st '.failed_phase = .phase'
+        recover_interrupted
+        TX_STAGE=none
+        st '.status = "failed" | .finished_at = $at | .error = $e | .after = (.after // .before)' \
+            --arg at "$(now_iso)" --arg e "the helper was interrupted (status $rc) during phase $at; $RECOVERY_NOTE"
+        log "== $OP finished: failed ($RECOVERY_NOTE)"
+        publish
+        record_last_job
+        write_config_json || true
+    fi
+    [ -z "$WORK" ] || rm -rf -- "$WORK"
+}
+
+# --- LinuxGSM ---------------------------------------------------------------
+
+PUMP_LINES=0 CHILD_PID=''
+pump() { # pump <raw output file> [final] — move new complete lines to the log
+    local raw=$1 total
+    total=$(wc -l <"$raw")
+    if [ "$total" -gt "$PUMP_LINES" ]; then
+        sed -n "$((PUMP_LINES + 1)),${total}p" "$raw" | sanitize | sed 's/^/    | /' | emit
+        PUMP_LINES=$total
+        publish
+    fi
+    if [ "${2:-}" = final ] && [ -n "$(tail -c 1 "$raw")" ]; then
+        { tail -n +"$((total + 1))" "$raw" && echo; } | sanitize | sed 's/^/    | /' | emit
+    fi
+}
+
+# Run one LinuxGSM subcommand as the game user. Output is streamed into the
+# log while it runs (SteamCMD takes minutes) and kept, sanitized, in
+# $WORK/lgsm.out for callers that parse it. Returns the command's status.
+# Upper bound for one LinuxGSM command. The unit's TimeoutStartSec (2 h) is
+# above the worst case of `all` with a rollback: lock 30 s + update-lgsm
+# 10 min + stop 5 + update 45 + mods-update 15 + start 5 + verify, then
+# stop 5 + start 5 + verify, plus the snapshot and its restore.
+lgsm_timeout() {
+    if [ -n "$LGSM_TIMEOUT" ]; then
+        echo "$LGSM_TIMEOUT"
+        return
+    fi
+    case $1 in
+        update | force-update) echo 2700 ;;
+        mods-update) echo 900 ;;
+        update-lgsm) echo 600 ;;
+        *) echo 300 ;;
+    esac
+}
+
+run_lgsm() {
+    local raw="$WORK/lgsm.raw" pid rc limit
+    limit=$(lgsm_timeout "$1")
+    : >"$raw"
+    PUMP_LINES=0
+    log "running: ${LGSM_SCRIPT##*/} $*"
+    # setsid: the game user's code gets its own session, so it has no
+    # controlling terminal (nothing typed "into" root's SSH session) and
+    # kill_child can take the whole group. 3>&- 9<&-: it inherits neither
+    # our stdout nor the lock.
+    if [ "$DIRECT" = 1 ]; then
+        setsid timeout -k 30 "$limit" "$LGSM_SCRIPT" "$@" >"$raw" 2>&1 </dev/null 3>&- 9<&- &
+    else
+        setsid timeout -k 30 "$limit" runuser -l "$LGSM_USER" -c "$(printf '%q ' "$LGSM_SCRIPT" "$@")" >"$raw" 2>&1 </dev/null 3>&- 9<&- &
+    fi
+    pid=$!
+    CHILD_PID=$pid
+    TREE=()
+    while kill -0 "$pid" 2>/dev/null; do
+        tree_note "$pid"
+        sleep "$PUMP_INTERVAL"
+        pump "$raw"
+    done
+    wait "$pid"
+    rc=$?
+    CHILD_PID=''
+    pump "$raw" final
+    sanitize <"$raw" >"$WORK/lgsm.out"
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        log "${LGSM_SCRIPT##*/} $1 did not finish within ${limit}s and was stopped"
+        # `timeout` only reached runuser and its direct child. Whatever that
+        # had started must not carry on while the job moves to its next step.
+        tree_kill
+    fi
+    TREE=()
+    log "${LGSM_SCRIPT##*/} $1 exited with status $rc"
+    return "$rc"
+}
+
+# --- versions ---------------------------------------------------------------
+
+strip_v() { sed -E 's/^[vV]//'; }
+
+ver_lgsm() {
+    read_tree "$LGSM_USER" "$LGSM_SCRIPT" "$TREE_FILE_MAX" "$WORK/ver.tmp" || return 0
+    sed -n -E 's/^version="?([^"]*)"?.*/\1/p' "$WORK/ver.tmp" | head -n 1
+}
+ver_cs2() {
+    read_tree "$LGSM_USER" "$APPMANIFEST" "$TREE_FILE_MAX" "$WORK/ver.tmp" || return 0
+    sed -n -E 's/^[[:space:]]*"buildid"[[:space:]]+"([0-9]+)".*/\1/p' "$WORK/ver.tmp" | head -n 1
+}
+con_matchzy() { sed -n -E 's/.*\[MatchZy v?([^] ]+) LOADED\].*/\1/p' "$1" | tail -n 1; }
+con_cssharp() { sed -n -E 's/.*CounterStrikeSharp API v?([0-9][0-9A-Za-z.+-]*).*/\1/p' "$1" | tail -n 1; }
+con_metamod() { sed -n -E 's/.*Metamod:Source [Vv]ersion ([0-9][0-9A-Za-z.+-]*).*/\1/p' "$1" | tail -n 1; }
+
+versions_json() { # lgsm cs2 metamod cssharp matchzy → JSON, "" becomes null
+    jq -n --arg lgsm "$1" --arg cs2 "$2" --arg mm "$3" --arg css "$4" --arg mz "$5" '
+        def n: if . == "" then null else . end;
+        {lgsm: ($lgsm | n), cs2_build: ($cs2 | n), metamod: ($mm | n),
+         cssharp: ($css | n), matchzy: ($mz | n)}'
+}
+
+recorded() { # recorded <key> — value from installed.json, or empty
+    jq -r --arg k "$1" '.[$k] // empty | strings' "$STATE_DIR/installed.json" 2>/dev/null
+}
+
+# The console log from byte <offset> on (at most the last CONSOLE_MAX bytes
+# of it), read as the game user with a time limit, sanitized.
+console_from() { # console_from <offset>
+    local from=$1 size
+    as_gs test -f "$CONSOLE_LOG" || return 0
+    size=$(as_gs stat -c %s -- "$CONSOLE_LOG" 2>/dev/null || echo 0)
+    if [ $((size - from)) -gt "$CONSOLE_MAX" ]; then
+        from=$((size - CONSOLE_MAX))
+    fi
+    as_user_t "$TREE_READ_TIMEOUT" "$LGSM_USER" tail -c "+$((from + 1))" -- "$CONSOLE_LOG" 2>/dev/null \
+        | head -c "$CONSOLE_MAX" | sanitize
+}
+
+console_snapshot() { # whole current console log, sanitized, to a work file
+    console_from 0 >"$1"
+}
+
+# Installed versions as JSON. Plugins: what the running server last printed
+# wins (it is the truth about what loaded); otherwise what the last `mods`
+# run recorded. Metamod has no reliable console line, so it comes from the
+# record — unless the console shows the record is out of date (someone ran
+# mods-update by hand), in which case it is reported as unknown.
+installed_versions() {
+    local con="$WORK/console.all" mm css mz c_mm c_css c_mz r_css r_mz
+    console_snapshot "$con"
+    c_mm=$(con_metamod "$con")
+    c_css=$(con_cssharp "$con")
+    c_mz=$(con_matchzy "$con")
+    r_css=$(recorded cssharp)
+    r_mz=$(recorded matchzy)
+    css=${c_css:-$r_css}
+    mz=${c_mz:-$r_mz}
+    mm=$(recorded metamod)
+    if { [ -n "$c_css" ] && [ -n "$r_css" ] && [ "$c_css" != "$r_css" ]; } \
+        || { [ -n "$c_mz" ] && [ -n "$r_mz" ] && [ "$c_mz" != "$r_mz" ]; }; then
+        mm=''
+    fi
+    [ -n "$mm" ] || mm=$c_mm
+    versions_json "$(ver_lgsm)" "$(ver_cs2)" "$mm" "$css" "$mz"
+}
+
+fetch() {
+    command -v curl >/dev/null 2>&1 || return 1
+    curl -fsSL --max-time 15 --retry 1 -A "$PROG" "$1" 2>/dev/null
+}
+
+# Latest upstream version of one component, cached for CACHE_TTL so a few
+# clicks on "Check now" do not burn the unauthenticated GitHub rate limit.
+# Prints nothing (→ null) when the lookup fails: that is not a failed job.
+latest_lookup() { # latest_lookup lgsm|metamod|cssharp|matchzy
+    local key=$1 cache="$STATE_DIR/latest-cache.json" now val
+    now=$(date +%s)
+    val=$(jq -r --arg k "$key" --argjson now "$now" --argjson ttl "$CACHE_TTL" '
+        .[$k] // empty | select(($now - .fetched_at) < $ttl) | .value' "$cache" 2>/dev/null)
+    if [ -n "$val" ]; then
+        printf '%s' "$val"
+        return 0
+    fi
+    case $key in
+        lgsm) val=$(fetch "$GITHUB_API/repos/GameServerManagers/LinuxGSM/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null) ;;
+        # Releases are tagged v1.0.<api>; the server only ever reports the
+        # API number ("CounterStrikeSharp API 380"), so compare on that.
+        cssharp) val=$(fetch "$GITHUB_API/repos/roflmuffin/CounterStrikeSharp/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null | sed -E 's/^[vV]?[0-9]+\.[0-9]+\.//') ;;
+        matchzy) val=$(fetch "$GITHUB_API/repos/shobhit-pathak/MatchZy/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null | strip_v) ;;
+        # "mmsource-2.0.0-git1491-linux.tar.gz" -> "2.0.0-git1491"
+        metamod) val=$(fetch "$MMS_LATEST_URL" | head -n 1 | tr -d '[:space:]' \
+            | sed -E 's/^mmsource-//; s/-linux\.tar\.gz$//') ;;
+    esac
+    if [[ ! $val =~ ^[A-Za-z0-9._+-]{1,96}$ ]]; then
+        log "latest $key: lookup failed (reported as unknown)"
+        return 0
+    fi
+    local tmp
+    tmp=$(mktemp "$cache.XXXXXX") || return 0
+    if { jq -e . "$cache" 2>/dev/null || echo '{}'; } \
+        | jq --arg k "$key" --arg v "$val" --argjson now "$now" '.[$k] = {value: $v, fetched_at: $now}' >"$tmp" \
+        && chmod 0644 "$tmp"; then
+        mv -fT "$tmp" "$cache"
+    else
+        rm -f -- "$tmp"
+    fi
+    printf '%s' "$val"
+}
+
+LATEST_CS2=''
+# Remote build id via `check-update` into LATEST_CS2 (empty when it cannot
+# be read). Not for use in $(…): a signal is only handled between commands,
+# and the main shell would sit in the substitution until SteamCMD is done.
+latest_cs2() {
+    run_lgsm check-update || true
+    LATEST_CS2=$(sed -n -E 's/.*Remote build:[[:space:]]*([0-9]+).*/\1/p' "$WORK/lgsm.out" | tail -n 1)
+}
+
+# --- console log / load health ----------------------------------------------
+
+LOAD_MM=false LOAD_CSS=false LOAD_MZ=false LOAD_ERR=''
+load_health() { # load_health <console text file>
+    LOAD_MM=false LOAD_CSS=false LOAD_MZ=false
+    LOAD_ERR=$(grep -m 1 -i 'MMS: Fatal error' "$1" 2>/dev/null || true)
+    if grep -q 'CounterStrikeSharp\.API Loaded Successfully' "$1" 2>/dev/null; then LOAD_CSS=true; fi
+    if grep -q -E '\[MatchZy [^] ]+ LOADED\]' "$1" 2>/dev/null; then LOAD_MZ=true; fi
+    # Metamod prints nothing dependable on success; CounterStrikeSharp can
+    # only have loaded through it.
+    if [ -z "$LOAD_ERR" ] && { [ "$LOAD_CSS" = true ] || grep -q -i 'Metamod:Source' "$1" 2>/dev/null; }; then
+        LOAD_MM=true
+    fi
+}
+load_json() {
+    jq -n --argjson mm "$LOAD_MM" --argjson css "$LOAD_CSS" --argjson mz "$LOAD_MZ" --arg e "$LOAD_ERR" \
+        '{metamod: $mm, cssharp: $css, matchzy: $mz, error: (if $e == "" then null else $e end)}'
+}
+
+MARK_INODE=0 MARK_OFF=0
+console_mark() { # remember where the console log ends now
+    MARK_INODE=$(as_gs stat -c %i -- "$CONSOLE_LOG" 2>/dev/null || echo 0)
+    MARK_OFF=$(as_gs stat -c %s -- "$CONSOLE_LOG" 2>/dev/null || echo 0)
+}
+console_since_mark() { # everything written after console_mark (never stale lines)
+    local inode size
+    inode=$(as_gs stat -c %i -- "$CONSOLE_LOG" 2>/dev/null || echo 0)
+    size=$(as_gs stat -c %s -- "$CONSOLE_LOG" 2>/dev/null || echo 0)
+    if [ "$inode" != "$MARK_INODE" ] || [ "$size" -lt "$MARK_OFF" ]; then
+        # LinuxGSM rotated the log at start: the whole file is new.
+        console_from 0
+    else
+        console_from "$MARK_OFF"
+    fi
+}
+
+VERIFY_ERR=''
+# Behavioural check: did the plugin stack load after the (re)start that
+# followed console_mark? With `require-block` (the mods transaction) a
+# missing demo-upload block is a failure too.
+verify_stack() { # verify_stack [require-block]
+    local deadline=$((SECONDS + VERIFY_TIMEOUT)) new="$WORK/console.new" missing
+    VERIFY_ERR=''
+    while :; do
+        console_since_mark >"$new"
+        load_health "$new"
+        if [ -n "$LOAD_ERR" ]; then
+            VERIFY_ERR="Metamod failed to load: $LOAD_ERR"
+            break
+        fi
+        if [ "$LOAD_CSS" = true ] && [ "$LOAD_MZ" = true ]; then
+            break
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            missing=''
+            [ "$LOAD_CSS" = true ] || missing='CounterStrikeSharp'
+            [ "$LOAD_MZ" = true ] || missing="${missing:+$missing, }MatchZy"
+            VERIFY_ERR="plugin stack did not load within ${VERIFY_TIMEOUT}s (no load line from: $missing)"
+            break
+        fi
+        sleep "$VERIFY_POLL"
+    done
+    st '.load = $l' --argjson l "$(load_json)"
+    if [ -z "$VERIFY_ERR" ] && [ "${1:-}" = require-block ] && have_snippet && ! demo_block_ok; then
+        VERIFY_ERR='demo-upload block is missing from the MatchZy config'
+    fi
+    record_block_state
+    if [ -n "$VERIFY_ERR" ]; then
+        log "verify FAILED: $VERIFY_ERR"
+        return 1
+    fi
+    log "verify OK: CounterStrikeSharp and MatchZy loaded"
+    return 0
+}
+
+# --- writing into the game tree ---------------------------------------------
+
+# Replace a file in the game tree with stdin, as the user who owns the tree:
+# a temp file beside it, then rename, so a crash never leaves half a file.
+# <mode> `keep` copies owner/group/mode from the existing file; otherwise the
+# file gets that mode (it is never wider than that, not even briefly).
+write_as() { # write_as <as_gs|as_cfg> <path> <keep|mode> < content
+    local as=$1 path=$2 mode=$3 tmp="$2.portal-tmp"
+    "$as" rm -f -- "$tmp"
+    if "$as" test -e "$path"; then
+        "$as" cp -p -- "$path" "$tmp" </dev/null || return 1
+        [ "$mode" = keep ] || "$as" chmod "$mode" -- "$tmp" || return 1
+    elif [ "$mode" = keep ]; then
+        return 1
+    else
+        "$as" install -m "$mode" /dev/null "$tmp" </dev/null || return 1
+    fi
+    if "$as" tee -- "$tmp" >/dev/null && "$as" mv -f -- "$tmp" "$path"; then
+        return 0
+    fi
+    "$as" rm -f -- "$tmp"
+    return 1
+}
+
+# --- gameinfo.gi ------------------------------------------------------------
+
+GAMEINFO_PATCHED=0
+# Valve's updates rewrite csgo/gameinfo.gi and drop the Metamod search path,
+# which silently unloads the whole plugin stack. Re-add it. The file has CRLF
+# line endings: the match must allow \r and the new line must carry \r\n, or
+# the patch quietly does nothing. (Moved here unchanged from the retired
+# cs2-update-and-patch.sh.)
+gameinfo_assert() {
+    local old="$WORK/gameinfo.old" new="$WORK/gameinfo.new" bak old_lines new_lines
+    GAMEINFO_PATCHED=0
+    if ! as_gs test -f "$GAMEINFO_PATH"; then
+        log "ERROR: $GAMEINFO_PATH missing - not touching anything"
+        return 1
+    fi
+    if ! read_tree "$LGSM_USER" "$GAMEINFO_PATH" "$TREE_FILE_MAX" "$old"; then
+        log "ERROR: cannot read $GAMEINFO_PATH (not a regular file, or implausibly large)"
+        return 1
+    fi
+    if grep -q "$MM_MARKER" "$old"; then
+        log "gameinfo.gi already has the Metamod search path - nothing to do"
+        return 0
+    fi
+    log "Metamod search path MISSING from gameinfo.gi - re-applying"
+    bak="$GAMEINFO_PATH.bak-$(date +%F-%H%M%S)"
+    if ! as_gs cp -p -- "$GAMEINFO_PATH" "$bak"; then
+        log "ERROR: backup failed"
+        return 1
+    fi
+    if ! awk '!d && /^[ \t]*Game[ \t]+csgo\r?$/ {
+            match($0, /^[ \t]*/); ind = substr($0, 1, RLENGTH)
+            printf "%sGame\tcsgo/addons/metamod\r\n", ind
+            d = 1
+         }
+         { print }' "$old" >"$new"; then
+        log "ERROR: awk failed"
+        return 1
+    fi
+    # Sanity-gate before overwriting: exactly one line added, marker present.
+    old_lines=$(wc -l <"$old")
+    new_lines=$(wc -l <"$new")
+    if [ ! -s "$new" ] || [ "$new_lines" -ne "$((old_lines + 1))" ] || ! grep -q "$MM_MARKER" "$new"; then
+        log "ERROR: patch sanity check failed (${old_lines} -> ${new_lines} lines) - leaving original alone"
+        return 1
+    fi
+    # Atomic (temp + rename), owner and mode copied from the original. The
+    # retired wrapper wrote in place to keep the inode; nothing depends on it.
+    if ! write_as as_gs "$GAMEINFO_PATH" keep <"$new"; then
+        log "ERROR: write-back failed, restore from $bak"
+        return 1
+    fi
+    GAMEINFO_PATCHED=1
+    log "patch applied (backup: $bak)"
+    # Every Valve update leaves one backup behind: keep the newest five.
+    as_gs find "$(dirname "$GAMEINFO_PATH")" -maxdepth 1 -type f -name "${GAMEINFO_PATH##*/}.bak-*" 2>/dev/null \
+        | sort -r | tail -n +6 | while IFS= read -r bak; do
+            as_gs rm -f -- "$bak"
+        done
+    return 0
+}
+
+# --- MatchZy config: managed blocks -----------------------------------------
+
+# Remove every BEGIN…END range. Half a block goes too, with what it held:
+#   BEGIN without END  the marker and the lines after it that look like block
+#                      content (<content> regex), up to the first that does not
+#   END without BEGIN  the marker and the lines right before it that match
+#                      <before> (empty: just the marker)
+# so a damaged demo-upload block cannot leave a stale token line behind, and
+# the operator's own lines around it survive.
+strip_block() { # strip_block <begin> <end> <content regex> <before regex> < config
+    awk -v b="$1" -v e="$2" -v c="$3" -v p="$4" '
+        function flush_held(   i) { for (i = 1; i <= h; i++) print held[i]; h = 0 }
+        function flush_half(   i) {
+            i = 2
+# …but never past another managed marker: a demo block that lost
+            # its END must not swallow the overrides block that follows it.
+            while (i <= n && buf[i] ~ c && buf[i] !~ /^\/\/ (BEGIN|END) /) i++
+            for (; i <= n; i++) print buf[i]
+            n = 0; inb = 0
+        }
+        {
+            line = $0; sub(/\r$/, "", line)
+            if (line == b) { flush_held(); if (inb) flush_half(); inb = 1; n = 0; buf[++n] = $0; next }
+            if (inb) {
+                if (line == e) { n = 0; inb = 0; next }
+                buf[++n] = $0; next
+            }
+            if (line == e) { h = 0; next }
+            if (p != "" && line ~ p) { held[++h] = $0; next }
+            flush_held()
+            print
+        }
+        END { if (inb) flush_half(); flush_held() }'
+}
+strip_demo_block() {
+    strip_block "$DEMO_BEGIN" "$DEMO_END" '^[ \t]*(//|matchzy_demo_upload_)' '^[ \t]*matchzy_demo_upload_'
+}
+strip_overrides_block() {
+    strip_block "$OVR_BEGIN" "$OVR_END" '^matchzy_[a-z0-9_]+ "[^"]*"$' ''
+}
+
+block_body() { # block_body <begin> <end> < config — body of the last block; 1 if none
+    awk -v b="$1" -v e="$2" '
+        { line = $0; sub(/\r$/, "", line) }
+        line == b { inb = 1; body = ""; next }
+        inb && line == e { inb = 0; found = 1; out = body; next }
+        inb { body = body $0 "\n" }
+        END { if (!found) exit 1; printf "%s", out }'
+}
+
+SNIPPET_LOADED=0 SNIPPET_OK=0
+# The enrollment snippet, normalised to end in exactly one newline, in
+# $WORK/snippet. It holds the bearer token: it is only ever copied file to
+# file, never logged, never an argument.
+have_snippet() {
+    if [ "$SNIPPET_LOADED" = 0 ]; then
+        SNIPPET_LOADED=1
+        if read_untrusted "$SNIPPET" 16384 >"$WORK/snippet.raw" 2>/dev/null && [ -s "$WORK/snippet.raw" ]; then
+            # shellcheck disable=SC2016  # sed script: append a final newline if missing
+            sed -e '$a\' "$WORK/snippet.raw" >"$WORK/snippet"
+            SNIPPET_OK=1
+        fi
+        rm -f -- "$WORK/snippet.raw"
+    fi
+    [ "$SNIPPET_OK" = 1 ]
+}
+
+read_config() { # current MatchZy config → <file>; empty if absent; 1 if it is not a readable regular file
+    if as_cfg test -e "$MATCHZY_CONFIG_PATH" || as_cfg test -L "$MATCHZY_CONFIG_PATH"; then
+        read_tree "$CFG_USER" "$MATCHZY_CONFIG_PATH" "$TREE_FILE_MAX" "$1"
+    else
+        : >"$1"
+    fi
+}
+
+# Is the demo-upload block in the config, byte-identical to the snippet?
+# Without a snippet (host enrolled without a demo token) only the markers
+# can be checked.
+demo_block_ok() {
+    local cur="$WORK/cfg.check"
+    read_config "$cur" 2>/dev/null || return 1
+    if have_snippet; then
+        block_body "$DEMO_BEGIN" "$DEMO_END" <"$cur" >"$WORK/cfg.block" 2>/dev/null || return 1
+        cmp -s "$WORK/cfg.block" "$WORK/snippet"
+    else
+        block_body "$DEMO_BEGIN" "$DEMO_END" <"$cur" >/dev/null 2>&1
+    fi
+}
+
+record_block_state() {
+    if demo_block_ok; then
+        st '.demo_upload_block_present = true'
+    else
+        st '.demo_upload_block_present = false'
+    fi
+}
+
+# Portal-managed MatchZy overrides: `cvar value` per line, written by the
+# agent. Re-validated here because this is the copy that reaches the config.
+OVR_DROPPED=0
+# The rules are the agent's (src/update.rs, validate_overrides), to the
+# letter: `name value` separated by one space; name ^matchzy_[a-z0-9_]+$, at
+# most 128 bytes, not portal-owned; value at most 256 bytes of printable
+# ASCII without `"`, `;` or `\`; at most 64 entries. A line that fails is
+# dropped and counted — verify-config then reports the overrides as not
+# applied, with the reason, rather than pretending.
+render_overrides() { # → $WORK/overrides.lines (`cvar "value"` per line), OVR_DROPPED
+    local out="$WORK/overrides.lines" raw="$WORK/overrides.raw" line name value n=0
+    local printable='^[ -~]*$'
+    : >"$out"
+    OVR_DROPPED=0
+    [ -e "$OVERRIDES" ] || [ -L "$OVERRIDES" ] || return 0
+    if ! read_untrusted "$OVERRIDES" 65536 >"$raw" 2>/dev/null; then
+        log "WARNING: MatchZy overrides file is not a plain file of at most 64 KiB readable by $AGENT_USER - ignoring it"
+        OVR_DROPPED=1
+        return 0
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        if [[ ! $line =~ ^(matchzy_[a-z0-9_]+)(\ (.*))?$ ]] || [ "${#BASH_REMATCH[1]}" -gt 128 ]; then
+            log "WARNING: ignoring malformed MatchZy override line"
+            OVR_DROPPED=$((OVR_DROPPED + 1))
+            continue
+        fi
+        name=${BASH_REMATCH[1]}
+        value=${BASH_REMATCH[3]:-}
+        case $name in
+            matchzy_demo_upload_* | matchzy_remote_* | matchzy_loadmatch* | matchzy_loadbackup_url)
+                log "WARNING: ignoring override for portal-owned cvar $name"
+                OVR_DROPPED=$((OVR_DROPPED + 1))
+                continue
+                ;;
+        esac
+        if [ "${#value}" -gt 256 ] || [[ ! $value =~ $printable ]] || [[ $value == *[\"\;\\]* ]]; then
+            log "WARNING: ignoring override for $name: value not allowed"
+            OVR_DROPPED=$((OVR_DROPPED + 1))
+            continue
+        fi
+        n=$((n + 1))
+        if [ "$n" -gt 64 ]; then
+            log "WARNING: more than 64 MatchZy overrides - ignoring the rest"
+            OVR_DROPPED=$((OVR_DROPPED + 1))
+            break
+        fi
+        printf '%s "%s"\n' "$name" "$value" >>"$out"
+    done <"$raw"
+    rm -f -- "$raw"
+}
+
+lines_after() { # lines_after <end marker> < config — what follows the last such line
+    awk -v e="$1" '
+        { line = $0; sub(/\r$/, "", line) }
+        line == e { found = 1; buf = ""; next }
+        found { buf = buf $0 "\n" }
+        END { printf "%s", buf }'
+}
+
+# File-level truth about the managed blocks, for the agent's heartbeat:
+# /run/portal-gs-update/config.json. (The running server cannot be asked:
+# MatchZy's settings are console commands, not cvars, and read back empty.)
+#   demo_upload_wired  true: the block is there, byte-identical to the
+#                      enrollment snippet, and no later line sets a
+#                      matchzy_demo_upload_* command over it. null: no snippet.
+#   overrides_applied  same for the overrides block against the overrides
+#                      file; false too when the helper had to reject a line
+#                      of that file. null: no overrides file.
+#   auto_repair        AUTO_REPAIR from gs-update.conf: may the agent run
+#                      repair-config on its own when one of the above is false
+# Reads only; never prints the token.
+write_config_json() {
+    local cur="$WORK/cfgv.cur" body="$WORK/cfgv.body" wired=null applied=null reason='' name tmp unreadable=0
+    if ! read_config "$cur" 2>/dev/null; then
+        : >"$cur"
+        unreadable=1
+    fi
+    if have_snippet; then
+        if [ "$unreadable" = 1 ]; then
+            wired=false
+            reason='the MatchZy config is not a readable regular file (or is implausibly large)'
+        elif ! block_body "$DEMO_BEGIN" "$DEMO_END" <"$cur" >"$body" 2>/dev/null || ! cmp -s "$body" "$WORK/snippet"; then
+            wired=false
+            reason='the demo-upload block is missing from the MatchZy config or differs from the enrollment snippet'
+        elif lines_after "$DEMO_END" <"$cur" | grep -qiE '^[[:space:]]*matchzy_demo_upload_'; then
+            wired=false
+            reason='a line after the demo-upload block sets a matchzy_demo_upload_* command and overrides it'
+        else
+            wired=true
+        fi
+    else
+        reason='no enrollment snippet on this host'
+    fi
+    if [ -e "$OVERRIDES" ] || [ -L "$OVERRIDES" ]; then
+        render_overrides
+        applied=true
+        if [ -s "$WORK/overrides.lines" ]; then
+            block_body "$OVR_BEGIN" "$OVR_END" <"$cur" >"$body" 2>/dev/null || : >"$body"
+            if ! cmp -s "$body" "$WORK/overrides.lines"; then
+                applied=false
+            else
+                lines_after "$OVR_END" <"$cur" >"$body"
+                while IFS=' ' read -r name _; do
+                    if grep -qE "^[[:space:]]*${name}([[:space:]]|\$)" "$body"; then
+                        applied=false
+                    fi
+                done <"$WORK/overrides.lines"
+            fi
+        elif block_body "$OVR_BEGIN" "$OVR_END" <"$cur" >/dev/null 2>&1; then
+            applied=false # the portal cleared its overrides; the block is still there
+        fi
+        if [ "$applied" = false ] && [ "$wired" != false ]; then
+            reason='the MatchZy overrides block is missing, out of date or overridden by a later line'
+        fi
+        if [ "$OVR_DROPPED" -gt 0 ]; then
+            # What is in the file is not what the portal asked for, and no
+            # repair can make it so.
+            applied=false
+            [ "$wired" = false ] || reason="$OVR_DROPPED line(s) of the MatchZy overrides file were rejected by the helper (or the file is unreadable)"
+        fi
+    fi
+    rm -f -- "$cur" "$body"
+    # Assembled privately, then renamed into the agent-writable directory.
+    jq -n --arg at "$(now_iso)" --argjson w "$wired" --argjson a "$applied" --arg r "$reason" --argjson ar "$AUTO_REPAIR" '{
+            checked_at: $at, demo_upload_wired: $w, overrides_applied: $a,
+            reason: (if $r == "" then null else $r end), auto_repair: $ar
+        }' >"$WORK/config.pub" || return 1
+    run_dir_claim "$RUN_DIR/config.json"
+    tmp=$(mktemp "$RUN_DIR/.config.XXXXXX" 2>/dev/null) || return 1
+    if cat "$WORK/config.pub" >"$tmp" 2>/dev/null && chmod 0644 "$tmp" && mv -fT "$tmp" "$RUN_DIR/config.json" 2>/dev/null; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+CONFIG_CHANGED=0
+# Re-assert both managed blocks at the end of the MatchZy config: the
+# demo-upload block from the enrollment snippet, then the overrides block.
+# Being last, they win over the upstream defaults earlier in the file.
+# Idempotent: an already-correct file is not rewritten.
+reconcile_config() {
+    local cur="$WORK/cfg.cur" new="$WORK/cfg.new"
+    CONFIG_CHANGED=0
+    if ! as_cfg test -d "$(dirname "$MATCHZY_CONFIG_PATH")"; then
+        log "ERROR: $(dirname "$MATCHZY_CONFIG_PATH") does not exist - is MatchZy installed?"
+        return 1
+    fi
+    if ! read_config "$cur"; then
+        log "ERROR: cannot read $MATCHZY_CONFIG_PATH as $CFG_USER"
+        return 1
+    fi
+    render_overrides
+    local snippet=0
+    if have_snippet; then snippet=1; fi
+    [ "$snippet" = 1 ] || log "no enrollment snippet at $SNIPPET - leaving the demo-upload block as it is"
+    # Overrides block first: with it gone, half a demo block before it has
+    # nothing after it to be confused with.
+    strip_overrides_block <"$cur" | if [ "$snippet" = 1 ]; then strip_demo_block; else cat; fi >"$new"
+    # Blocks start on their own line (blockinfile does the same).
+    if [ -s "$new" ] && [ -n "$(tail -c 1 "$new")" ]; then
+        echo >>"$new"
+    fi
+    if [ "$snippet" = 1 ]; then
+        {
+            printf '%s\n' "$DEMO_BEGIN"
+            cat "$WORK/snippet"
+            printf '%s\n' "$DEMO_END"
+        } >>"$new"
+    fi
+    if [ -s "$WORK/overrides.lines" ]; then
+        {
+            printf '%s\n' "$OVR_BEGIN"
+            cat "$WORK/overrides.lines"
+            printf '%s\n' "$OVR_END"
+        } >>"$new"
+    fi
+    if as_cfg test -e "$MATCHZY_CONFIG_PATH" && cmp -s "$cur" "$new"; then
+        log "MatchZy config: managed blocks already correct"
+    else
+        # Atomic, and 0640 from the first byte: the token is in this file.
+        if ! write_as as_cfg "$MATCHZY_CONFIG_PATH" 0640 <"$new"; then
+            log "ERROR: cannot write $MATCHZY_CONFIG_PATH as $CFG_USER"
+            return 1
+        fi
+        CONFIG_CHANGED=1
+        log "MatchZy config: managed blocks re-asserted ($(wc -l <"$WORK/overrides.lines") override(s))"
+    fi
+    # Same mode the Ansible task sets, also when nothing had to be written.
+    as_cfg chmod 0640 -- "$MATCHZY_CONFIG_PATH" || log "WARNING: could not set mode 0640 on the MatchZy config"
+    rm -f -- "$cur" "$new" "$WORK/cfg.check" "$WORK/cfg.block"
+    st '.config_changed = (.config_changed or $c)' --argjson c "$([ "$CONFIG_CHANGED" = 1 ] && echo true || echo false)"
+    return 0
+}
+
+# --- MatchZy config: what the update did to operator settings (§5.2) --------
+
+cvars_json() { # config text on stdin (managed blocks already stripped) → {cvar: value}
+    sed -E 's/\r$//' | awk '
+        /^[ \t]*\/\// { next }
+        {
+            line = $0; sub(/^[ \t]+/, "", line)
+            if (line == "") next
+            name = line; sub(/[ \t].*/, "", name)
+            if (name !~ /^[A-Za-z_][A-Za-z0-9_.]*$/) next
+            val = line; sub(/^[^ \t]+[ \t]*/, "", val)
+            if (val ~ /^"/) {
+                val = substr(val, 2); i = index(val, "\"")
+                if (i > 0) val = substr(val, 1, i - 1)
+            } else {
+                sub(/[ \t]*\/\/.*$/, "", val); sub(/[ \t]+$/, "", val)
+            }
+            printf "%s\t%s\n", name, val
+        }' | jq -Rn '[inputs | split("\t") | {key: .[0], value: (.[1:] | join("\t"))}] | from_entries'
+}
+
+config_capture() { # config_capture <prefix> — cvars and per-file hashes of cfg/MatchZy/*.cfg
+    local prefix=$1 dir f base
+    dir=$(dirname "$MATCHZY_CONFIG_PATH")
+    read_config "$WORK/$prefix.cfg" 2>/dev/null || : >"$WORK/$prefix.cfg"
+    strip_overrides_block <"$WORK/$prefix.cfg" | strip_demo_block >"$WORK/$prefix.stripped"
+    rm -f -- "$WORK/$prefix.cfg"
+    cvars_json <"$WORK/$prefix.stripped" >"$WORK/$prefix.cvars" || echo '{}' >"$WORK/$prefix.cvars"
+    : >"$WORK/$prefix.hashes"
+    while IFS= read -r f; do
+        base=${f##*/}
+        if [ "$f" = "$MATCHZY_CONFIG_PATH" ]; then
+            # Hash it without the managed blocks: re-asserting them is not a change.
+            printf '%s\t%s\n' "$base" "$(sha256sum <"$WORK/$prefix.stripped" | cut -d ' ' -f 1)"
+        else
+            printf '%s\t%s\n' "$base" "$(as_user_t "$TREE_READ_TIMEOUT" "$LGSM_USER" sha256sum -- "$f" 2>/dev/null | cut -d ' ' -f 1)"
+        fi >>"$WORK/$prefix.hashes"
+    done < <(as_gs find "$dir" -maxdepth 1 -type f -name '*.cfg' 2>/dev/null | sort)
+    rm -f -- "$WORK/$prefix.stripped"
+    jq -Rn '[inputs | split("\t") | {key: .[0], value: .[1]}] | from_entries' <"$WORK/$prefix.hashes" >"$WORK/$prefix.files" \
+        || echo '{}' >"$WORK/$prefix.files"
+}
+
+config_report() { # compare the `before` and `after` captures into state
+    st '.config_report = (
+# A value is withheld when the setting is one that carries a token or
+        # a password, whatever its case, or when the value itself mentions
+        # one (`foo 1; matchzy_demo_upload_header_value "…"` on one line).
+        def red($k; $v): if ($k + " " + $v) | test("matchzy_(demo_upload|remote)_|rcon_password|sv_password|tv_password|bearer "; "i")
+                         then "[redacted]" else $v end;
+        {
+          cvars_changed: [ $b[0] | to_entries[] | . as $x
+              | select(($a[0] | has($x.key)) and $a[0][$x.key] != $x.value)
+              | {name: $x.key, before: red($x.key; $x.value), after: red($x.key; $a[0][$x.key])} ],
+          cvars_removed: [ $b[0] | keys[] | . as $k | select($a[0] | has($k) | not) ],
+          cvars_added:   [ $a[0] | keys[] | . as $k | select($b[0] | has($k) | not) ],
+          files_changed: [ ($fb[0] + $fa[0]) | keys[] | . as $k | select($fb[0][$k] != $fa[0][$k]) ]
+        })' \
+        --slurpfile b "$WORK/before.cvars" --slurpfile a "$WORK/after.cvars" \
+        --slurpfile fb "$WORK/before.files" --slurpfile fa "$WORK/after.files"
+}
+
+# --- snapshots --------------------------------------------------------------
+
+SNAP='' SNAP_MEMBERS=()
+snapshot_flags() { # compression flag for tar, by what this host has
+    if command -v zstd >/dev/null 2>&1; then echo --zstd; else echo --gzip; fi
+}
+
+snapshot_create() {
+    local ext=zst flag rc=0
+    flag=$(snapshot_flags)
+    [ "$flag" = --zstd ] || ext=gz
+    SNAP_MEMBERS=()
+    # A member that is a symlink (or reached through one) would be archived
+    # as a link and "restored" by replacing the link — the real files would
+    # never be snapshotted. Refuse before anything is changed.
+    local link
+    for link in addons "${MZ_REL%%/*}" "$MZ_REL"; do
+        if as_gs test -L "$CSGO_DIR/$link"; then
+            log "ERROR: $CSGO_DIR/$link is a symbolic link - refusing to snapshot (and so to update) through it"
+            return 1
+        fi
+    done
+    as_gs test -d "$CSGO_DIR/addons" && SNAP_MEMBERS+=(addons)
+    as_gs test -d "$CSGO_DIR/$MZ_REL" && SNAP_MEMBERS+=("$MZ_REL")
+    if [ "${#SNAP_MEMBERS[@]}" -eq 0 ]; then
+        log "ERROR: neither addons/ nor $MZ_REL/ exists under $CSGO_DIR - nothing to snapshot"
+        return 1
+    fi
+    SNAP="$STATE_DIR/snapshots/$JOB_ID.tar.$ext"
+    # tar reads the tree as the game user; root only owns the output, which
+    # is 0600: it holds the MatchZy config, and with it the token. Plugin
+    # logs are left out (large, and written while we read).
+    (umask 077 && as_gs tar -C "$CSGO_DIR" "$flag" --exclude='addons/*/logs' -cf - "${SNAP_MEMBERS[@]}" >"$SNAP" 2>"$WORK/tar.err") || rc=$?
+    sanitize <"$WORK/tar.err" | sed 's/^/    | /' | emit
+    # 1 = "file changed as we read it": the server is still running at this
+    # point and a plugin wrote something. The archive is complete.
+    if [ "$rc" -gt 1 ] || ! tar "$flag" -tf "$SNAP" >/dev/null 2>&1; then
+        rm -f -- "$SNAP"
+        SNAP=''
+        log "ERROR: snapshot failed (tar status $rc)"
+        return 1
+    fi
+    log "snapshot: ${SNAP_MEMBERS[*]} -> $SNAP ($(du -h -- "$SNAP" | cut -f 1))"
+    # Keep the newest SNAPSHOT_KEEP — and this one whatever the clock says.
+    find "$STATE_DIR/snapshots" -maxdepth 1 -type f -name '*.tar.*' ! -path "$SNAP" -printf '%T@ %p\n' \
+        | sort -rn | tail -n +"$SNAPSHOT_KEEP" | cut -d ' ' -f 2- \
+        | while IFS= read -r old; do
+            rm -f -- "$old"
+            log "snapshot: pruned ${old##*/}"
+        done
+    return 0
+}
+
+# Put the snapshot back without ever being left with neither tree: check the
+# archive, unpack it beside the live directories, then swap each one in. The
+# replaced directories (with whatever the failed update added) are only
+# removed once every swap has worked.
+snapshot_restore() {
+    local m flag=--zstd stage="$CSGO_DIR/.portal-restore" aside="$CSGO_DIR/.portal-replaced"
+    local swapped=() failed='' undone=1 d rel
+    RESTORE_NOTE=''
+    case $SNAP in *.gz) flag=--gzip ;; esac
+    if [ -z "$SNAP" ] || ! tar "$flag" -tf "$SNAP" >/dev/null 2>&1; then
+        RESTORE_NOTE='the snapshot is missing or unreadable; the current files were left in place'
+        log "ERROR: $RESTORE_NOTE"
+        return 1
+    fi
+    log "restoring ${SNAP_MEMBERS[*]} from ${SNAP##*/}"
+    as_gs rm -rf -- "$stage" "$aside"
+    if ! as_gs mkdir -- "$stage" "$aside"; then
+        RESTORE_NOTE='could not create the staging directories; the current files were left in place'
+        log "ERROR: $RESTORE_NOTE"
+        return 1
+    fi
+    # Extract as the game user (root only feeds it the archive).
+    as_gs tar -C "$stage" "$flag" -xpf - <"$SNAP" 2>&1 | sanitize | sed 's/^/    | /' | emit
+    if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+        failed='unpacking the snapshot failed'
+    else
+        for m in "${SNAP_MEMBERS[@]}"; do
+            as_gs test -d "$stage/$m" || failed="the snapshot does not contain $m"
+        done
+    fi
+    if [ -n "$failed" ]; then
+        as_gs rm -rf -- "$stage" "$aside"
+        RESTORE_NOTE="$failed; the current files were left in place"
+        log "ERROR: $RESTORE_NOTE"
+        return 1
+    fi
+
+    for m in "${SNAP_MEMBERS[@]}"; do
+        as_gs mkdir -p -- "$(dirname "$aside/$m")"
+        if as_gs test -e "$CSGO_DIR/$m" && ! as_gs mv -- "$CSGO_DIR/$m" "$aside/$m"; then
+            failed="could not move the current $m aside"
+            break
+        fi
+        if ! as_gs mv -- "$stage/$m" "$CSGO_DIR/$m"; then
+            as_gs mv -- "$aside/$m" "$CSGO_DIR/$m" 2>/dev/null
+            failed="could not move the restored $m into place"
+            break
+        fi
+        swapped+=("$m")
+    done
+    if [ -n "$failed" ]; then
+        # All or nothing: a tree with old addons and new configs (or the
+        # reverse) is worse than either. Put back what was already swapped.
+        for m in ${swapped[@]+"${swapped[@]}"}; do
+            if ! { as_gs mv -- "$CSGO_DIR/$m" "$stage/$m" && as_gs mv -- "$aside/$m" "$CSGO_DIR/$m"; }; then
+                undone=0
+            fi
+        done
+        if [ "$undone" = 1 ]; then
+            as_gs rm -rf -- "$stage" "$aside"
+            RESTORE_NOTE="$failed; nothing was restored, the updated files are all in place"
+        else
+            # Leave the directories: they may hold the only copy of something.
+            RESTORE_NOTE="$failed, and undoing the part already restored failed too: of ${SNAP_MEMBERS[*]}, restored: ${swapped[*]:-none}; the rest is in $stage and $aside"
+        fi
+        log "ERROR: $RESTORE_NOTE"
+        return 1
+    fi
+
+    # Plugin logs are not in the snapshot. Carry over the ones the replaced
+    # (failed) build wrote: they are the diagnosis.
+    while IFS= read -r d; do
+        rel=${d#"$aside"/}
+        if as_gs test -d "$(dirname "$CSGO_DIR/$rel")" && ! as_gs test -e "$CSGO_DIR/$rel"; then
+            as_gs mv -- "$d" "$CSGO_DIR/$rel" || log "WARNING: could not keep $rel"
+        fi
+    done < <(as_gs find "$aside/addons" -mindepth 2 -maxdepth 2 -type d -name logs 2>/dev/null)
+    as_gs rm -rf -- "$stage" "$aside"
+    return 0
+}
+
+# --- operations -------------------------------------------------------------
+
+record_installed() { # after a verified mods run: what is installed now
+    local con="$WORK/console.new" mm css mz
+    mm=$(latest_lookup metamod)
+    css=$(con_cssharp "$con")
+    [ -n "$css" ] || css=$(latest_lookup cssharp)
+    mz=$(con_matchzy "$con")
+    [ -n "$mz" ] || mz=$(latest_lookup matchzy)
+    versions_json "$(ver_lgsm)" "$(ver_cs2)" "$mm" "$css" "$mz" \
+        | jq --arg at "$(now_iso)" --arg job "$JOB_ID" '. + {recorded_at: $at, job_id: $job}' >"$WORK/installed.json" \
+        && atomic_install "$WORK/installed.json" "$STATE_DIR/installed.json" \
+        || log "WARNING: could not record installed.json"
+}
+
+op_check() {
+    local installed latest avail
+    phase check
+    installed=$(installed_versions)
+    st '.before = $v' --argjson v "$installed"
+    latest_cs2
+    latest=$(versions_json "$(latest_lookup lgsm)" "$LATEST_CS2" "$(latest_lookup metamod)" \
+        "$(latest_lookup cssharp)" "$(latest_lookup matchzy)")
+    load_health "$WORK/console.all"
+    st '.latest = $l | .load = $h' --argjson l "$latest" --argjson h "$(load_json)"
+    record_block_state
+    avail=$(jq -n --argjson i "$installed" --argjson l "$latest" '
+        def cmp($k): if $i[$k] == null or $l[$k] == null then null else $i[$k] != $l[$k] end;
+        {lgsm: cmp("lgsm"), game: cmp("cs2_build"), metamod: cmp("metamod"),
+         cssharp: cmp("cssharp"), matchzy: cmp("matchzy")}
+        | .mods = ([.metamod, .cssharp, .matchzy] | if any(. == true) then true
+                    elif all(. == null) then null else false end)')
+    jq --arg at "$(now_iso)" --argjson avail "$avail" '{
+        checked_at: $at, job_id, installed: .before, latest,
+        update_available: $avail, load, demo_upload_block_present
+    }' "$WORK/state.json" >"$WORK/check.json" \
+        && atomic_install "$WORK/check.json" "$STATE_DIR/check.json" \
+        || finish failed "could not write check.json"
+    st '.after = .before'
+    finish succeeded
+}
+
+step_lgsm() { # update LinuxGSM itself; 0 ok
+    phase lgsm-update
+    run_lgsm update-lgsm
+}
+
+op_lgsm() {
+    st '.before = $v' --argjson v "$(installed_versions)"
+    if ! step_lgsm; then
+        st '.after = $v' --argjson v "$(installed_versions)"
+        finish failed "LinuxGSM update-lgsm failed"
+    fi
+    st '.after = $v' --argjson v "$(installed_versions)"
+    finish succeeded
+}
+
+game_update_cmd() { if [ "$FORCE" = 1 ]; then echo force-update; else echo update; fi; }
+
+op_game() {
+    local before_build after_build update_rc=0
+    st '.before = $v' --argjson v "$(installed_versions)"
+    before_build=$(ver_cs2)
+    phase game-update
+    # LinuxGSM stops and restarts the server itself around an update — if
+    # there is one. Interrupted in there, on_exit makes sure the server is
+    # up, without pretending it was restarted when it never went down.
+    TX_STAGE=maybe
+    run_lgsm "$(game_update_cmd)" || update_rc=$?
+    # The phase that broke, whatever comes after it.
+    [ "$update_rc" -eq 0 ] || st '.failed_phase = "game-update"'
+    # Whatever the update said, never leave a stripped gameinfo.gi behind.
+    phase gameinfo
+    if ! gameinfo_assert; then
+        st '.after = $v' --argjson v "$(installed_versions)"
+        finish failed "could not repair the Metamod search path in gameinfo.gi"
+    fi
+    after_build=$(ver_cs2)
+    if [ "$GAMEINFO_PATCHED" = 1 ] || [ "$before_build" != "$after_build" ]; then
+        # LinuxGSM restarts the server itself after an update, but with the
+        # stripped gameinfo.gi; one more restart loads the plugin stack.
+        phase restart
+        console_mark
+        run_lgsm restart || log "WARNING: restart exited non-zero"
+        TX_STAGE=started
+        st '.restarted = true'
+        phase verify
+        if ! verify_stack; then
+            st '.after = $v' --argjson v "$(installed_versions)"
+            finish failed "$VERIFY_ERR"
+        fi
+    else
+        log "no new build and gameinfo.gi intact - not restarting"
+        record_block_state
+    fi
+    st '.after = $v' --argjson v "$(installed_versions)"
+    if [ "$update_rc" -ne 0 ]; then
+        finish failed "LinuxGSM $(game_update_cmd) exited with status $update_rc"
+    fi
+    finish succeeded
+}
+
+# Bring the server back on the pre-update files and say so. Never returns.
+rollback() { # rollback <reason>
+    local reason=$1
+    log "ROLLING BACK: $reason"
+    st '.failed_phase = .phase'
+    phase rollback
+    run_lgsm stop || true
+    if ! snapshot_restore; then
+        # Not down for good: start it on whatever is there, and say so.
+        TX_STAGE=down
+        gameinfo_assert || true
+        console_mark
+        run_lgsm start || log "WARNING: start exited non-zero"
+        TX_STAGE=started
+        st '.restarted = true'
+        verify_stack || true
+        st '.after = $v' --argjson v "$(installed_versions)"
+        finish failed "$reason; restoring the snapshot ${SNAP##*/} also failed: $RESTORE_NOTE; the server was started on those files"
+    fi
+    TX_STAGE=down
+    reconcile_config || log "WARNING: could not re-assert the managed config blocks after restore"
+    # The server is back on the old files: nothing in the config changed
+    # after all, and a report of what the update would have done misleads.
+    st '.config_report = null | .config_changed = false'
+    gameinfo_assert || log "WARNING: could not assert the Metamod search path after restore"
+    console_mark
+    run_lgsm start || log "WARNING: start exited non-zero"
+    TX_STAGE=started
+    st '.restarted = true'
+    if verify_stack; then
+        st '.after = $v' --argjson v "$(installed_versions)"
+        finish rolled_back "$reason"
+    fi
+    st '.after = $v' --argjson v "$(installed_versions)"
+    finish failed "$reason; rolled back to ${SNAP##*/} but the previous plugin set did not load either: $VERIFY_ERR"
+}
+
+# The §4.5 transaction. With <with_game>=1 (operation `all`) the game build
+# is updated while the server is down, so everything shares one restart.
+mods_transaction() { # mods_transaction <with_game 0|1>
+    local with_game=$1 game_rc=0
+    phase snapshot
+    snapshot_create || finish failed "could not snapshot the plugin files; nothing was changed"
+    config_capture before
+
+    phase stop
+    TX_STAGE=down
+    run_lgsm stop || log "WARNING: stop exited non-zero (server may already have been down)"
+
+    if [ "$with_game" = 1 ]; then
+        phase game-update
+        run_lgsm "$(game_update_cmd)" || game_rc=$?
+        if [ "$game_rc" -ne 0 ]; then
+            st '.failed_phase = "game-update"'
+            # Plugins untouched: no restore needed, just bring it back up.
+            phase gameinfo
+            gameinfo_assert || log "WARNING: could not assert the Metamod search path"
+            phase start
+            console_mark
+            run_lgsm start || log "WARNING: start exited non-zero"
+            TX_STAGE=started
+            st '.restarted = true'
+            phase verify
+            verify_stack || true
+            st '.after = $v' --argjson v "$(installed_versions)"
+            finish failed "LinuxGSM $(game_update_cmd) exited with status $game_rc; plugins were not updated"
+        fi
+    fi
+
+    phase mods-update
+    TX_STAGE=dirty
+    run_lgsm mods-update || rollback "LinuxGSM mods-update exited with status $?"
+
+    phase reconcile-config
+    reconcile_config || rollback "could not re-assert the managed blocks in the MatchZy config"
+    config_capture after
+    config_report
+
+    phase gameinfo
+    gameinfo_assert || rollback "could not assert the Metamod search path in gameinfo.gi"
+
+    phase start
+    console_mark
+    run_lgsm start || rollback "LinuxGSM start exited with status $?"
+    st '.restarted = true'
+
+    # Still `dirty`: interrupted before the stack is seen to load, the old
+    # files go back.
+    phase verify
+    verify_stack require-block || rollback "$VERIFY_ERR"
+    TX_STAGE=started
+
+    phase record
+    record_installed
+    st '.after = $v' --argjson v "$(installed_versions)"
+    finish succeeded
+}
+
+op_mods() {
+    st '.before = $v' --argjson v "$(installed_versions)"
+    mods_transaction 0
+}
+
+op_all() {
+    st '.before = $v' --argjson v "$(installed_versions)"
+    if ! step_lgsm; then
+        st '.after = $v' --argjson v "$(installed_versions)"
+        finish failed "LinuxGSM update-lgsm failed; nothing else was attempted"
+    fi
+    mods_transaction 1
+}
+
+op_repair_config() {
+    st '.before = $v | .after = $v' --argjson v "$(installed_versions)"
+    phase reconcile-config
+    if ! reconcile_config; then
+        record_block_state
+        finish failed "could not re-assert the managed blocks in the MatchZy config"
+    fi
+    st '.config_report = {cvars_changed: [], cvars_removed: [], cvars_added: [],
+            files_changed: (if .config_changed then [$f] else [] end)}' --arg f "${MATCHZY_CONFIG_PATH##*/}"
+    record_block_state
+    # If the file changed, the running server has not read it (and if it did
+    # not, there is nothing to re-read: a repair that cannot change anything
+    # must not re-execute the config on every retry). The helper has
+    # no dependable way to tell it (it has no RCON, and LinuxGSM's console
+    # `send` is not something to bet demos on), so the agent does: on
+    # needs_reload it runs `exec MatchZy/config.cfg` over its local RCON.
+    st '.needs_reload = .config_changed'
+    finish succeeded
+}
+
+# --- main -------------------------------------------------------------------
+
+if [ "${1:-}" = --unit ]; then
+    UNIT=1
+    shift
+fi
+[ "$#" -eq 1 ] || usage
+OP=$1
+case $OP in
+    check | lgsm | game | mods | all | repair-config | verify-config) ;;
+    *) usage ;;
+esac
+
+load_conf
+check_deps
+ensure_dirs
+
+if [ "$OP" = verify-config ]; then
+    # Not a job: no request, no state.json, and never in a job's way.
+    acquire_lock quiet
+    trap on_exit EXIT
+    make_work
+    write_config_json || die "$EX_FAILED" "could not write $RUN_DIR/config.json"
+    exit 0
+fi
+
+acquire_lock
+trap on_exit EXIT
+make_work
+read_request
+
+if [ -z "${JOURNAL_STREAM:-}" ] && [ "${GS_UPDATE_NO_SYSLOG:-0}" != 1 ] && command -v logger >/dev/null 2>&1; then
+    USE_LOGGER=1 # cron / SSH: stdout is not the journal
+fi
+
+# Ignore further signals from inside the trap itself: a second SIGTERM
+# arriving between `exit` and the EXIT handler must not skip the recovery.
+trap 'trap "" TERM INT HUP; exit 143' TERM
+trap 'trap "" TERM INT HUP; exit 130' INT
+trap 'trap "" TERM INT HUP; exit 129' HUP
+
+open_state
+log "$PROG $OP starting (job $JOB_ID, trigger $TRIGGER)"
+
+case $OP in
+    check) op_check ;;
+    lgsm) op_lgsm ;;
+    game) op_game ;;
+    mods) op_mods ;;
+    all) op_all ;;
+    repair-config) op_repair_config ;;
+esac

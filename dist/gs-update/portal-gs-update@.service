@@ -1,0 +1,33 @@
+[Unit]
+Description=Portal game-server update helper (%i)
+Documentation=https://github.com/mtottenh/cg-server-agent#game-server-updates
+
+[Service]
+# The instance name is the operation: check | lgsm | game | mods | all |
+# repair-config | verify-config. The agent (user portal-agent) may start exactly these
+# instances and nothing else — see 50-portal-gs-update.rules. The helper
+# takes no other input from the unit: the portal's job id travels in
+# /run/portal-gs-update/request.json.
+Type=oneshot
+ExecStart=/usr/sbin/portal-gs-update --unit %i
+SyslogIdentifier=portal-gs-update
+# LinuxGSM starts CS2 inside a tmux server that must outlive this job. Where
+# that tmux server ends up is decided by PAM, not here: the helper runs
+# LinuxGSM through `runuser -l`, and with pam_systemd in that stack the
+# session — tmux included — is moved to a logind session scope of the game
+# user; without it, it stays in this unit's cgroup. Which one applies is
+# checked at deploy time (`systemd-cgls` after a `mods` run); the unit must
+# be right for both. control-group (the default) and mixed would kill a tmux
+# server left in this cgroup the moment the helper exits, so: process.
+# systemd then signals only the helper; the helper's exit handler stops its
+# own LinuxGSM command and everything that command started (by process
+# tree, never a tmux server or anything under one) and, if the job had
+# stopped the server, restores the plugin snapshot when needed and starts
+# it again. Nothing of the job is left running without the lock.
+KillMode=process
+# Above the sum of the helper's own bounds for the longest path (`all` with
+# a rollback: ~95 min, see lgsm_timeout in the helper).
+TimeoutStartSec=2h
+# On stop or timeout the helper gets SIGTERM and needs time for the recovery
+# above (snapshot restore, start, verify) before systemd resorts to SIGKILL.
+TimeoutStopSec=15min

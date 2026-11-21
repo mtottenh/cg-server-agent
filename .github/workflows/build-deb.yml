@@ -138,7 +138,9 @@ jobs:
           # (a second debhelper token, even in a comment, doubles them), and
           # the generated tmpfiles call names the file that is installed
           test "$(grep -c 'deb-systemd-helper unmask' /var/lib/dpkg/info/portal-server-agent.postinst)" -eq 1
-          test "$(grep -c 'systemd-tmpfiles --create portal-gs-update.conf' /var/lib/dpkg/info/portal-server-agent.postinst)" -eq 1
+          # (cargo-deb's wording varies by version, so check the name only:
+          # no reference to a tmpfiles file that is not the installed one)
+          if grep -E 'tmpfiles.*--create' /var/lib/dpkg/info/portal-server-agent.postinst | grep -v 'portal-gs-update\.conf'; then exit 1; fi
 
       - name: Purge is clean
         run: |

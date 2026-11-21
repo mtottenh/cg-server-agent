@@ -30,7 +30,8 @@ ReadWritePaths=-/etc/portal/agent
 # request.json for the update helper; its state.json is read from here too.
 # (/var/lib/portal-gs-update is only read, which ProtectSystem allows.)
 ReadWritePaths=-/run/portal-gs-update
-# /var/lib/portal-server-agent: which finished update job was last reported.
+# /var/lib/portal-server-agent: which update results the portal has
+# acknowledged, and the one result (if any) only the agent has a copy of.
 StateDirectory=portal-server-agent
 # The helper is started with `systemctl start` over the system D-Bus
 # (AF_UNIX below); polkit decides, see 50-portal-gs-update.rules.

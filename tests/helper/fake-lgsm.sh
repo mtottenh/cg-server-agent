@@ -10,6 +10,7 @@
 #   fake/next_lgsm        version `update-lgsm` moves to
 #   fake/send_rc          exit status of `send`
 #   fake/rotate           `start` begins a new console log (LinuxGSM does)
+#   fake/slow             `update` prints a line, then takes this many seconds
 #
 # Every call is appended to fake/calls.
 # shellcheck disable=SC2034  # read by the helper, rewritten by update-lgsm
@@ -56,6 +57,10 @@ case ${1:-} in
         ;;
     update | force-update)
         echo 'Details: rcon_password "lgsm-rcon-secret"'
+        if [ -e "$fake/slow" ]; then
+            echo "SteamCMD downloading"
+            sleep "$(cat "$fake/slow")"
+        fi
         remote=$(cat "$fake/remote_build")
         if [ "$(local_build)" != "$remote" ]; then
             sed -i -E "s/(\"buildid\"[[:space:]]+)\"[0-9]+\"/\1\"$remote\"/" "$manifest"

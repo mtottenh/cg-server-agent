@@ -23,6 +23,7 @@ OVR_BEGIN='// BEGIN PORTAL MANAGED — matchzy overrides'
 OVR_END='// END PORTAL MANAGED — matchzy overrides'
 
 pass=0 fail=0 current='' current_failed=0
+EXTRA_ENV=''
 T='' GS='' CSGO='' FAKE='' RUN='' STATE='' CFG='' OUT='' RC=0
 
 # --- assertions --------------------------------------------------------------
@@ -515,6 +516,36 @@ test_repair_config_flags_reload_when_send_fails() {
     # No enrollment snippet: nothing to assert, nothing invented.
     st_eq .demo_upload_block_present false
     st_eq .config_changed false
+}
+
+# What the agent relies on while a job runs: state.json says `running`,
+# names a live pid whose command line identifies the helper, and already
+# carries the output so far.
+test_state_is_published_while_the_job_runs() {
+    echo 2 >"$FAKE/slow"
+    helper game &
+    local bg=$! pid
+    for _ in $(seq 1 50); do
+        grep -q 'SteamCMD downloading' "$RUN/state.json" 2>/dev/null && break
+        sleep 0.1
+    done
+    st_eq .status running
+    st_eq .phase game-update
+    st_eq .finished_at null
+    has "$RUN/state.json" 'SteamCMD downloading'
+    pid=$(st .pid)
+    tr '\0' ' ' <"/proc/$pid/cmdline" | grep -q 'portal-gs-update game' \
+        || bad "state pid $pid is not the helper: $(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)"
+    # A second operation is refused while it runs, and says so.
+    local first_out=$OUT
+    OUT="$T/out2.txt"
+    helper check
+    eq "exit status of the second run" 75 "$RC"
+    OUT=$first_out
+    wait "$bg"
+    st_eq .status succeeded
+    st_eq .phase done
+    [ ! -e "/proc/$pid" ] || bad "helper pid should be gone"
 }
 
 test_lock_contention_fails_fast() {

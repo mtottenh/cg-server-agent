@@ -146,7 +146,10 @@ it off (the agent then only reports). After a `repair-config` the agent
 makes the running server re-read the file with `exec MatchZy/config.cfg`
 over its local RCON — but only while MatchZy reports no match loaded
 (`get5_status` gamestate `none`); until then, and while RCON is down, the
-reload stays pending and is retried every 10 seconds.
+reload stays pending (across agent restarts too) and is retried every 10
+seconds. If MatchZy does not answer at all for 3 minutes — the plugin stack
+is not loaded — it is asked every 5 minutes instead, and when it answers
+again it has just been loaded and has read the file: the reload is dropped.
 
 **When a job is interrupted.** A job waits up to 30 s for the lock (a
 `verify-config` holds it for a moment); `verify-config` itself never waits.
@@ -154,9 +157,25 @@ If the helper is stopped mid-job (SIGTERM, unit timeout) it kills the
 LinuxGSM command it was running and then puts back what it took apart: if
 plugin files may be half-updated it restores the snapshot, and if it had
 stopped the server it starts it again and checks that the plugins loaded.
-The result says what was done. The unit uses `KillMode=process` — the CS2
-tmux server lives in the unit's cgroup and must survive the helper — so
-this clean-up is the helper's job, not systemd's.
+The result says what was done. A LinuxGSM command that runs into its time
+limit is treated the same way: whatever it had started (SteamCMD, a mod
+installer) is stopped before the job moves on.
+
+The unit uses `KillMode=process`, so all of this is the helper's job, not
+systemd's. The reason: LinuxGSM starts CS2 in a tmux server that must
+outlive the helper, and whether that tmux server ends up in the unit's
+cgroup or in a logind session scope of the game user depends on the host's
+PAM configuration (`pam_systemd` in the `runuser-l` stack). The helper
+relies on neither — it finds its own processes by process tree and never
+touches a tmux server or anything under one — but which of the two applies
+should be looked at once at deploy time (`systemd-cgls` after a `mods`
+run). The nightly cron has always started the server the same way
+(`su - cs2server -c …`), from a root process whose session ends.
+
+**Run by hand or from cron** it is `portal-gs-update <operation>`. Only the
+unit passes `--unit`, which is what makes the helper look at the agent's
+`request.json`; a manual or cron run never adopts a job id the agent wrote
+for a unit start that did not happen.
 
 **Privileges.** The agent stays unprivileged (`NoNewPrivileges`, no sudo, no
 access to `/home`). It starts `portal-gs-update@<operation>.service`
@@ -172,12 +191,12 @@ survives an agent restart or upgrade and a dropped connection.
 | `/etc/portal/gs-update.conf` | config management | where LinuxGSM lives; presence = opted in |
 | `/run/portal-gs-update/state.json` | helper | the current/last operation, rewritten at every phase |
 | `/run/portal-gs-update/config.json` | helper | `{checked_at, demo_upload_wired, overrides_applied, reason}` — the managed blocks as found in the MatchZy config |
-| `/run/portal-gs-update/request.json` | agent | `{job_id, operation, trigger}` for the unit about to start |
+| `/run/portal-gs-update/request.json` | agent | `{job_id, operation, trigger, created_at}` for the unit about to start; honoured only by `--unit`, only for 60 s |
 | `/run/portal-gs-update/lock` | helper | one operation at a time (a second one exits 75) |
 | `/var/lib/portal-gs-update/check.json` | helper | last `check` |
 | `/var/lib/portal-gs-update/installed.json` | helper | versions recorded by the last successful `mods`/`all` |
 | `/var/lib/portal-gs-update/last-job.json` | helper | last finished non-check job (replayed to the portal until acknowledged) |
-| `/var/lib/portal-server-agent/` | agent | `acked-jobs` (results the portal acknowledged), `unacked-result.json` (the one result only the agent has) |
+| `/var/lib/portal-server-agent/` | agent | what must survive an agent restart: `acked-jobs` (results the portal acknowledged), `unacked-result.json` (the one result only the agent has), `pending-job.json` (a unit it started that has not reported yet), `reload-pending`, `auto-repair.json` (the backoff) |
 | `/var/lib/portal-gs-update/snapshots/` | helper, 0700 | plugin snapshots for rollback |
 | `/etc/portal/agent/matchzy_overrides.cfg` | agent | portal-managed MatchZy overrides |
 
@@ -263,10 +282,13 @@ Errors:
 `started: true` means systemd accepted the start. The helper may then wait
 up to 30 s for the lock. If no state appears, the agent asks systemd about
 the unit (after 10 s, then every 2 s): while it is active the job is simply
-still `starting`; once the unit is gone without a trace (it never got the
-lock, the request was refused, the unit failed) the agent sends an
-`update_result` with `status: "failed"`, `phase: "starting"` and
-`agent_synthesized: true`.
+still `starting`; once systemd has said twice in a row that the unit is not
+active and it left no trace (it never got the lock, the request was
+refused, the unit failed) the agent sends an `update_result` with
+`status: "failed"`, `phase: "starting"` and `agent_synthesized: true`. A
+`systemctl` that fails or times out counts as no answer. The claim on a
+started job is kept on disk, so this also works when the agent itself is
+restarted in between.
 
 **`update_status`** — output is the current content of `state.json`
 (the object described under `update_result`, without `type`), or `null` if
@@ -419,8 +441,9 @@ job is sent at once). Dropped, not queued, while the portal is unreachable.
 - `demo_upload_block_present`: the block in `config.cfg` is identical to
   the enrollment snippet at the end of this job (`demo_upload_wired` in
   the heartbeat additionally requires that nothing after it overrides it).
-- `needs_reload`: `true` on every successful `repair-config` — the file is
-  right but the running server has not re-read it. Informational: the
+- `needs_reload`: `true` when a successful `repair-config` changed the
+  file (`config_changed`) — it is right now, but the running server has
+  not re-read it. Informational: the
   agent acts on it itself by running `exec MatchZy/config.cfg` over its
   local RCON once no match is loaded (`reload_pending` in the heartbeat
   shows it waiting). `false` for every other operation (`mods` and `all`

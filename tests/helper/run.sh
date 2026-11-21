@@ -233,7 +233,7 @@ test_check_reports_installed_and_latest() {
     st_eq .before.metamod null
     st_eq .latest.lgsm v26.7.0
     st_eq .latest.cs2_build 2000
-    st_eq .latest.metamod mmsource-2.0.0-git1491-linux.tar.gz
+    st_eq .latest.metamod 2.0.0-git1491
     st_eq .latest.cssharp 380
     st_eq .latest.matchzy 0.9.3
     st_eq .load.cssharp true
@@ -261,7 +261,7 @@ test_check_survives_network_failure_and_caches() {
     helper check
     eq "exit status" 0 "$RC"
     st_eq .latest.matchzy 0.9.3
-    st_eq .latest.metamod mmsource-2.0.0-git1491-linux.tar.gz
+    st_eq .latest.metamod 2.0.0-git1491
     # Cache expired and still no network: unknown, not a failed job.
     EXTRA_ENV=GS_UPDATE_CACHE_TTL=0 helper check
     eq "exit status" 0 "$RC"
@@ -328,7 +328,7 @@ test_mods_update_reasserts_block_and_reports_config() {
     eq "files_changed" 'config.cfg,live.cfg' "$(st '.config_report.files_changed | join(",")')"
 
     eq "installed.json matchzy" 0.9.3 "$(jq -r .matchzy "$STATE/installed.json")"
-    eq "installed.json metamod" mmsource-2.0.0-git1491-linux.tar.gz "$(jq -r .metamod "$STATE/installed.json")"
+    eq "installed.json metamod" 2.0.0-git1491 "$(jq -r .metamod "$STATE/installed.json")"
     eq "last-job.json" "$(st .job_id)" "$(jq -r .job_id "$STATE/last-job.json")"
     eq "snapshots kept" 1 "$(find "$STATE/snapshots" -type f | wc -l)"
     eq "snapshot mode" 600 "$(stat -c %a "$(find "$STATE/snapshots" -type f | head -n 1)")"

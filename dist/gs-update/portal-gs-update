@@ -838,7 +838,9 @@ latest_lookup() { # latest_lookup lgsm|metamod|cssharp|matchzy
         # API number ("CounterStrikeSharp API 380"), so compare on that.
         cssharp) val=$(fetch "$GITHUB_API/repos/roflmuffin/CounterStrikeSharp/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null | sed -E 's/^[vV]?[0-9]+\.[0-9]+\.//') ;;
         matchzy) val=$(fetch "$GITHUB_API/repos/shobhit-pathak/MatchZy/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null | strip_v) ;;
-        metamod) val=$(fetch "$MMS_LATEST_URL" | head -n 1 | tr -d '[:space:]') ;;
+        # "mmsource-2.0.0-git1491-linux.tar.gz" -> "2.0.0-git1491"
+        metamod) val=$(fetch "$MMS_LATEST_URL" | head -n 1 | tr -d '[:space:]' \
+            | sed -E 's/^mmsource-//; s/-linux\.tar\.gz$//') ;;
     esac
     if [[ ! $val =~ ^[A-Za-z0-9._+-]{1,96}$ ]]; then
         log "latest $key: lookup failed (reported as unknown)"

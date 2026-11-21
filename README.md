@@ -138,10 +138,25 @@ MatchZy's settings are console commands, not cvars, and read back empty
 over RCON. The agent starts `verify-config` on every connect and every
 5 minutes, reports the result in its heartbeat, and — if someone ran
 `./cs2server mods-update` by hand and the demo-upload block is gone, or the
-portal's overrides are not in the file — starts `repair-config` itself (at
-most once per 10 minutes; it restarts nothing). After a `repair-config` the
-agent makes the running server re-read the file with
-`exec MatchZy/config.cfg` over its local RCON.
+portal's overrides are not in the file — starts `repair-config` itself. It
+restarts nothing. It is rate-limited: 10 minutes after the first repair,
+doubling up to 6 hours while repairs do not leave the config healthy, back
+to 10 minutes once it is. `AUTO_REPAIR=false` in `gs-update.conf` switches
+it off (the agent then only reports). After a `repair-config` the agent
+makes the running server re-read the file with `exec MatchZy/config.cfg`
+over its local RCON — but only while MatchZy reports no match loaded
+(`get5_status` gamestate `none`); until then, and while RCON is down, the
+reload stays pending and is retried every 10 seconds.
+
+**When a job is interrupted.** A job waits up to 30 s for the lock (a
+`verify-config` holds it for a moment); `verify-config` itself never waits.
+If the helper is stopped mid-job (SIGTERM, unit timeout) it kills the
+LinuxGSM command it was running and then puts back what it took apart: if
+plugin files may be half-updated it restores the snapshot, and if it had
+stopped the server it starts it again and checks that the plugins loaded.
+The result says what was done. The unit uses `KillMode=process` — the CS2
+tmux server lives in the unit's cgroup and must survive the helper — so
+this clean-up is the helper's job, not systemd's.
 
 **Privileges.** The agent stays unprivileged (`NoNewPrivileges`, no sudo, no
 access to `/home`). It starts `portal-gs-update@<operation>.service`
@@ -161,16 +176,26 @@ survives an agent restart or upgrade and a dropped connection.
 | `/run/portal-gs-update/lock` | helper | one operation at a time (a second one exits 75) |
 | `/var/lib/portal-gs-update/check.json` | helper | last `check` |
 | `/var/lib/portal-gs-update/installed.json` | helper | versions recorded by the last successful `mods`/`all` |
-| `/var/lib/portal-gs-update/last-job.json` | helper | last finished non-check job (replayed to the portal if undelivered) |
+| `/var/lib/portal-gs-update/last-job.json` | helper | last finished non-check job (replayed to the portal until acknowledged) |
+| `/var/lib/portal-server-agent/` | agent | `acked-jobs` (results the portal acknowledged), `unacked-result.json` (the one result only the agent has) |
 | `/var/lib/portal-gs-update/snapshots/` | helper, 0700 | plugin snapshots for rollback |
 | `/etc/portal/agent/matchzy_overrides.cfg` | agent | portal-managed MatchZy overrides |
 
 Helper exit codes: 0 succeeded, 1 failed, 3 rolled back, 64 bad usage,
-65 bad `request.json`, 69 missing dependency, 75 another operation is
-running, 78 not configured. Full output goes to the journal
-(`journalctl -t portal-gs-update`). Lines mentioning
-`matchzy_demo_upload_header_value`, `rcon_password`, `sv_password` or
-`Bearer ` are redacted before they are written anywhere.
+65 bad `request.json`, 69 missing dependency, 75 another operation still
+holds the lock (after 30 s for a job; at once for `verify-config`), 78 not
+configured, 143 stopped by SIGTERM (after recovery). Full output goes to
+the journal (`journalctl -t portal-gs-update`). Lines mentioning
+`matchzy_demo_upload_header_value`, `rcon_password`, `sv_password`,
+`tv_password` or `Bearer ` are redacted — whole line, whatever bytes it
+contains — before they are written anywhere.
+
+The helper is root code next to two less privileged users, so: everything
+in the game tree is read and written as the LinuxGSM user (files are
+replaced by rename); the agent-writable inputs (`matchzy_portal.cfg`,
+`matchzy_overrides.cfg`, `request.json`) are read as the agent user, in one
+open that refuses symlinks and FIFOs and stops at a size cap; and nothing
+in `/run/portal-gs-update` is ever read by root.
 
 Tests: `tests/helper/run.sh` (fake game tree + fake LinuxGSM; no root).
 
@@ -196,6 +221,7 @@ and never sends the new commands.
 | `update_check` | — | JSON, below |
 | `update_start` | `{operation, job_id}` | JSON, below |
 | `update_status` | — | JSON, below |
+| `update_ack` | `{job_id}` | JSON, below |
 | `set_matchzy_overrides` | `{overrides: {cvar: value}}` | JSON, below |
 
 `exec` runs one console command per frame. The agent refuses, with
@@ -234,14 +260,23 @@ Errors:
 - `could not start portal-gs-update@<operation>.service: …` — systemd or
   polkit said no.
 
-`started: true` means systemd accepted the start. If the helper then never
-runs (it lost the lock to the nightly cron, the unit failed) the agent
-sends an `update_result` with `status: "failed"`, `phase: "starting"` and
-`agent_synthesized: true` after 60 s.
+`started: true` means systemd accepted the start. The helper may then wait
+up to 30 s for the lock. If no state appears, the agent asks systemd about
+the unit (after 10 s, then every 2 s): while it is active the job is simply
+still `starting`; once the unit is gone without a trace (it never got the
+lock, the request was refused, the unit failed) the agent sends an
+`update_result` with `status: "failed"`, `phase: "starting"` and
+`agent_synthesized: true`.
 
 **`update_status`** — output is the current content of `state.json`
 (the object described under `update_result`, without `type`), or `null` if
 no operation has run since boot.
+
+**`update_ack`** — `args.job_id` (`^[0-9a-f-]{36}$`): the portal has stored
+the `update_result` for this job. Output: `{"acked": "<job_id>"}`. Always
+succeeds for a well-formed id, known or not, repeated or not. Until a
+result is acknowledged the agent sends it again on every (re)connect — see
+"Delivery" below. Works without the `lgsm_update` capability.
 
 **`set_matchzy_overrides`** — replaces the whole override set; `{}` clears
 it. Rules, all-or-nothing (one bad entry rejects the request and leaves the
@@ -251,9 +286,14 @@ previous file in place):
 - name matches `^matchzy_[a-z0-9_]+$` (≤ 128 chars) and is not
   `matchzy_demo_upload_*`, `matchzy_remote_*`, `matchzy_loadmatch*` or
   `matchzy_loadbackup_url`;
-- value is a string, number or boolean; as text it is ≤ 256 characters and
-  contains no `"`, no `;` and no control characters (so no newlines).
-  Strings are trimmed.
+- value is a string, number or boolean; as text it is ≤ 256 bytes of
+  printable ASCII (0x20–0x7E) without `"`, `;` or `\` — so no newlines,
+  tabs, or any non-ASCII character (U+2028 and its relatives included).
+  Leading and trailing spaces of strings are dropped.
+
+The helper applies the same rules to the file. Should a line in it not pass
+(only possible if the file was written by something other than the agent),
+that line is left out and `overrides_applied` is `false` with the reason.
 
 The agent writes the file and starts `repair-config` to apply it. Output:
 `{"written": <n>, "started": true, "job_id": "<uuid>", "operation": "repair-config"}`,
@@ -276,6 +316,7 @@ Every 30 s:
   "capabilities": ["lgsm_update"],
   "demo_upload_wired": true,
   "overrides_applied": null,
+  "reload_pending": false,
   "update_job": {"job_id": "…", "operation": "mods", "phase": "verify", "status": "running"}
 }
 ```
@@ -299,7 +340,13 @@ Every 30 s:
   one of those commands; `false`: it does not; `null`: no overrides were
   ever set on this host, or unknown as above.
 - When either is `false` the agent starts `repair-config` itself (trigger
-  `auto_repair`), at most once per 10 minutes and never while a job runs.
+  `auto_repair`), never while a job runs, unless the host's
+  `gs-update.conf` says `AUTO_REPAIR=false`. First repair at once, the next
+  no sooner than 10 minutes later, doubling to at most 6 hours while the
+  config does not come back healthy.
+- `reload_pending` (0.3.0+) — `true` while a `repair-config` has changed
+  the MatchZy config file and the running server has not re-read it yet
+  (the agent waits for RCON and for no match to be loaded).
 - `update_job` (0.3.0+) — the operation in flight, or `null`. `phase` is
   `starting` between the agent starting the unit and the helper's first
   state write. `status` is always `running` here.
@@ -375,17 +422,28 @@ job is sent at once). Dropped, not queued, while the portal is unreachable.
 - `needs_reload`: `true` on every successful `repair-config` — the file is
   right but the running server has not re-read it. Informational: the
   agent acts on it itself by running `exec MatchZy/config.cfg` over its
-  local RCON. `false` for every other operation (`mods` and `all` restart
-  the server, which reads the file).
+  local RCON once no match is loaded (`reload_pending` in the heartbeat
+  shows it waiting). `false` for every other operation (`mods` and `all`
+  restart the server, which reads the file).
+- `state_publish_failed`: `true` if the helper could not write `state.json`
+  during the job (run directory full). The job ran regardless; the result
+  then reaches the portal from the helper's own record.
 - `config_report`: what the update did to operator settings, with the
-  managed blocks excluded. Values of `matchzy_demo_upload_*` and
-  `matchzy_remote_*` are `"[redacted]"`. `null` for jobs that do not touch
+  managed blocks excluded. A value is `"[redacted]"` when the setting's
+  name (any case) or the value itself mentions `matchzy_demo_upload_`,
+  `matchzy_remote_`, `rcon_password`, `sv_password`, `tv_password` or
+  `Bearer `. `null` for jobs that do not touch
   the config (`lgsm`, `game`, `check`) and for `rolled_back` (the old files
   are back); for `repair-config` only `files_changed` can be non-empty.
 - `error`: one line; for `rolled_back` it is the reason for the rollback.
 - `agent_synthesized: true` (only then present): the result was made up by
-  the agent because the helper never produced one — it did not start within
-  60 s, or its process disappeared mid-job.
+  the agent because the helper never produced one — its unit ended without
+  writing any state, or the helper disappeared mid-job (systemd says the
+  unit is no longer active and its process is gone). Reported once, also
+  across agent restarts. If the helper turns out to have finished after
+  all, its real result follows under the same `job_id` and supersedes it.
+- A job interrupted by SIGTERM reports `failed` with an `error` saying what
+  the helper put back (snapshot restored or not, server started or not).
 
 A failed `check` is also reported as an `update_result` (so the error is
 visible); a successful one only through `update_state`.
@@ -415,18 +473,20 @@ then `null` too. `update_available.mods` is `true` if any plugin differs,
 `null` if none could be compared. Upstream lookups are cached on the host
 for 10 minutes.
 
-**Reconnect.** On every connect the agent sends `update_state`, then the
-`update_result` of the last finished job if the portal has not had it yet
-(tracked in `/var/lib/portal-server-agent/last-sent-job`, so it also holds
-across an agent restart). A job that finishes while the channel is down is
-therefore still delivered, once the channel is back.
+**Delivery.** A frame written to the socket is not a result the portal has
+stored, so results are delivered at least once, keyed on `job_id`:
 
-`exec` runs one console command per frame. The agent refuses, with
-`{ok: false, error: "refused: …"}`, anything containing `;` or control
-characters, and any command whose verb is portal-owned (`rcon_password`,
-`sv_password`, `tv_password`, `sv_rcon_*`, `matchzy_remote_*`,
-`matchzy_demo_upload_*`, `matchzy_loadmatch*`, `matchzy_loadbackup_url`,
-`logaddress_*`, `sv_downloadurl`, `host_writeconfig`), could hide another
-command (`alias`, `exec`), or would end the process (`quit`, `exit`,
-`_restart`, `killserver`, `crash`). The portal applies the same rule first;
-this copy is defence in depth.
+- A result is sent when the job ends, and again **on every (re)connect**
+  until the portal acknowledges it with `update_ack`. Acknowledgements
+  survive agent restarts.
+- What is replayed is bounded: the last finished job (from the helper's
+  `last-job.json`) and the latest result only the agent has (a synthesized
+  failure or a failed check). Never a backlog — an older unacknowledged
+  result is dropped when a newer one of the same kind exists.
+- Within one connection a result is sent once.
+- A portal that never sends `update_ack` (one that predates it) receives
+  the last result again on each reconnect and must tolerate that.
+
+On every connect the agent sends, in order: `update_state` (when it has the
+capability), the unacknowledged results, then live frames. Progress frames
+from before the connection are not replayed.

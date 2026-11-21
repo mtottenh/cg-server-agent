@@ -456,19 +456,32 @@ finish() { # finish <status> [error] — terminal; never returns
     exit "$code"
 }
 
-# Stop the LinuxGSM command this helper is running, and everything it
-# started in its session (runuser, the LinuxGSM script, SteamCMD). The CS2
-# server is not among them: LinuxGSM puts it in a tmux server, which is its
-# own session.
+descendants() { # every process below <pid>, as it is right now
+    local c
+    for c in $(cat "/proc/$1/task/$1/children" 2>/dev/null || pgrep -P "$1" 2>/dev/null); do
+        echo "$c"
+        descendants "$c"
+    done
+}
+
+# Stop the LinuxGSM command this helper is running and everything below it
+# (runuser, the LinuxGSM script, SteamCMD), so nothing of the job keeps
+# working on the game tree once the lock is released. By process tree, not
+# just by process group: `runuser -l … -c` puts the game user's shell in a
+# session of its own. The CS2 server is not below it: LinuxGSM starts it in
+# a tmux server, which detaches.
 kill_child() {
     [ -n "$CHILD_PID" ] || return 0
-    local n=0
-    kill -TERM -- "-$CHILD_PID" 2>/dev/null || kill -TERM "$CHILD_PID" 2>/dev/null
+    local n=0 pids
+    pids=$(descendants "$CHILD_PID")
+    # shellcheck disable=SC2086  # a list of pids
+    kill -TERM -- "-$CHILD_PID" $pids 2>/dev/null || kill -TERM "$CHILD_PID" 2>/dev/null
     while kill -0 "$CHILD_PID" 2>/dev/null && [ "$n" -lt 40 ]; do
         sleep 0.25
         n=$((n + 1))
     done
-    kill -KILL -- "-$CHILD_PID" 2>/dev/null
+    # shellcheck disable=SC2086
+    kill -KILL -- "-$CHILD_PID" $pids 2>/dev/null
     wait "$CHILD_PID" 2>/dev/null
     CHILD_PID=''
 }

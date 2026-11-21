@@ -45,7 +45,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends jq zstd shellcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends jq zstd curl python3 procps shellcheck
 
       - name: shellcheck
         run: shellcheck --severity=warning dist/gs-update/portal-gs-update tests/helper/run.sh tests/helper/fake-lgsm.sh

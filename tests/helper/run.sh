@@ -905,7 +905,7 @@ test_snapshot_leaves_out_plugin_logs_and_restores_by_swap() {
 # 6. An interrupted job must not leave the server down.
 test_sigterm_while_the_server_is_stopped_starts_it_again() {
     echo 2000 >"$FAKE/remote_build"
-    echo 30 >"$FAKE/slow"
+    echo 31 >"$FAKE/slow"
     helper_bg all
     local pid=$!
     wait_for_phase game-update 'SteamCMD downloading'
@@ -925,6 +925,7 @@ test_sigterm_while_the_server_is_stopped_starts_it_again() {
     # The LinuxGSM command it was running is gone with it (no orphan without the lock).
     sleep 0.3
     if pgrep -f "$GS/cs2server update" >/dev/null; then bad "the LinuxGSM child is still running"; fi
+    if pgrep -f 'sleep 31' >/dev/null; then bad "a process started by the LinuxGSM command is still running"; fi
     eq "work dirs left" 0 "$(find "$STATE" -maxdepth 1 -name '.work.*' | wc -l)"
 }
 

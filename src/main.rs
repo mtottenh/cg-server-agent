@@ -4,12 +4,14 @@
 //! `enroll` exchanges a one-time token + locally generated CSR for a signed
 //! client certificate. The default `run` mode maintains an outbound mTLS
 //! WebSocket to the portal, executes match-setup commands via RCON on
-//! localhost, and reports `get5_status` heartbeats.
+//! localhost, reports `get5_status` heartbeats, and drives the LinuxGSM
+//! update helper (docs/gameserver-lgsm-updates-design.md §6).
 
 mod enroll;
 mod rcon;
 mod run;
 mod tls;
+mod update;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

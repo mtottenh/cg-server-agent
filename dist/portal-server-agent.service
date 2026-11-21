@@ -21,8 +21,19 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 # `-` = tolerate the path not existing yet: the dir is created by `enroll`,
-# which may run after the first `systemctl start` attempt.
-ReadOnlyPaths=-/etc/portal/agent
+# which may run after the first `systemctl start` attempt (restart the agent
+# after enrolling, or these stay read-only for the running process).
+# Writable for one file: matchzy_overrides.cfg (portal-managed MatchZy
+# overrides, written atomically, so the directory must be writable). The
+# agent already owns everything in here.
+ReadWritePaths=-/etc/portal/agent
+# request.json for the update helper; its state.json is read from here too.
+# (/var/lib/portal-gs-update is only read, which ProtectSystem allows.)
+ReadWritePaths=-/run/portal-gs-update
+# /var/lib/portal-server-agent: which finished update job was last reported.
+StateDirectory=portal-server-agent
+# The helper is started with `systemctl start` over the system D-Bus
+# (AF_UNIX below); polkit decides, see 50-portal-gs-update.rules.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 MemoryMax=256M
 

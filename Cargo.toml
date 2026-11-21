@@ -1,6 +1,6 @@
 [package]
 name = "portal-server-agent"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -9,7 +9,7 @@ description = "Game-server agent: outbound mTLS control channel between a CS2/Ma
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal", "process", "sync"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 rustls = "0.23"

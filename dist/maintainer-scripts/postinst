@@ -33,6 +33,16 @@ case "$1" in
             echo "portal-server-agent: seeded /etc/portal/portal-server-agent.env from example — edit, enroll, then systemctl start portal-server-agent"
         fi
 
+        # Update helper: persistent state (last check, installed versions,
+        # plugin snapshots — those hold the MatchZy config, so 0700) and the
+        # runtime directory it shares with the agent. tmpfiles needs the
+        # portal-agent group, created above.
+        install -d -o root -g root -m 0755 /var/lib/portal-gs-update
+        install -d -o root -g root -m 0700 /var/lib/portal-gs-update/snapshots
+        if command -v systemd-tmpfiles >/dev/null 2>&1; then
+            systemd-tmpfiles --create /usr/lib/tmpfiles.d/portal-gs-update.conf || true
+        fi
+
         # If `enroll` ran before the package was (re)installed, make sure the
         # service user can read its own material.
         if [ -d /etc/portal/agent ]; then

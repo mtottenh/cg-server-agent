@@ -36,12 +36,22 @@ Runs on a CS2 game-server host beside MatchZy. Maintains an outbound \
 mTLS WebSocket to the portal, executes match-setup commands via local \
 RCON, and reports get5_status heartbeats. The portal never connects \
 inbound and never stores RCON credentials."""
-depends = "$auto, ca-certificates"
+# jq/zstd/curl/util-linux (flock, runuser): the update helper. polkit: the
+# rule that lets the agent start the helper's unit (JS rules need polkit
+# >= 0.106, i.e. `polkitd`; 0.105's `policykit-1` installs but ignores them).
+depends = "$auto, ca-certificates, jq, zstd, curl, util-linux, polkitd | policykit-1"
 section = "net"
 priority = "optional"
 assets = [
     ["target/release/portal-server-agent", "usr/bin/portal-server-agent", "755"],
     ["dist/portal-server-agent.env.example", "etc/portal/portal-server-agent.env.example", "0644"],
+    # LinuxGSM update helper (README "Game-server updates"). Root-run through
+    # the template unit; the polkit rule is the agent's only privilege.
+    ["dist/portal-gs-update", "usr/sbin/portal-gs-update", "0755"],
+    ["dist/portal-gs-update@.service", "usr/lib/systemd/system/portal-gs-update@.service", "0644"],
+    ["dist/50-portal-gs-update.rules", "usr/share/polkit-1/rules.d/50-portal-gs-update.rules", "0644"],
+    ["dist/portal-gs-update.tmpfiles.conf", "usr/lib/tmpfiles.d/portal-gs-update.conf", "0644"],
+    ["dist/gs-update.conf.example", "etc/portal/gs-update.conf.example", "0644"],
 ]
 # postinst creates the portal-agent user and seeds the env file; without
 # this cargo-deb ships the unit with no user behind it and the service can

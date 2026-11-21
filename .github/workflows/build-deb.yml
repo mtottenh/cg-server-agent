@@ -107,11 +107,39 @@ jobs:
           systemd-analyze verify /usr/lib/systemd/system/portal-server-agent.service \
             || systemd-analyze verify /lib/systemd/system/portal-server-agent.service
 
+      # The LinuxGSM update helper and the three files that give the agent
+      # exactly one privilege: starting its template unit.
+      - name: Update helper sanity
+        run: |
+          set -x
+          test -x /usr/sbin/portal-gs-update
+          test "$(stat -c '%U:%G %a' /usr/sbin/portal-gs-update)" = "root:root 755"
+          test -f /usr/lib/systemd/system/portal-gs-update@.service
+          test -f /usr/share/polkit-1/rules.d/50-portal-gs-update.rules
+          test -f /usr/lib/tmpfiles.d/portal-gs-update.conf
+          test -f /etc/portal/gs-update.conf.example
+          systemd-analyze verify portal-gs-update@check.service
+          # postinst: state dir, and the runtime dir via tmpfiles (sticky,
+          # group-writable by the agent for request.json)
+          test "$(stat -c '%U:%G %a' /var/lib/portal-gs-update)" = "root:root 755"
+          test "$(sudo stat -c '%U:%G %a' /var/lib/portal-gs-update/snapshots)" = "root:root 700"
+          test "$(stat -c '%U:%G %a' /run/portal-gs-update)" = "root:portal-agent 1775"
+          # helper dependencies came with the deb
+          command -v jq zstd curl flock runuser
+          # an unconfigured host opts out with 78 and writes no state
+          rc=0; sudo /usr/sbin/portal-gs-update check || rc=$?
+          test "$rc" -eq 78
+          ! test -e /run/portal-gs-update/state.json
+          # so does the agent's capability: no gs-update.conf, no lgsm_update
+          ! sudo test -e /etc/portal/gs-update.conf
+
       - name: Purge is clean
         run: |
           sudo dpkg --purge portal-server-agent
           ! sudo test -e /etc/portal/portal-server-agent.env
           ! getent passwd portal-agent
+          ! test -e /var/lib/portal-gs-update
+          ! test -e /usr/sbin/portal-gs-update
 
   # Attach to the GitHub release only after the smoke install passed.
   # softprops creates the release if the tag push is the first sighting.

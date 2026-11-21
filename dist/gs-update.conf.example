@@ -1,0 +1,18 @@
+# /etc/portal/gs-update.conf — tells portal-gs-update where LinuxGSM lives.
+# Rendered by configuration management. Without this file the helper exits
+# 78 and the agent does not advertise the `lgsm_update` capability: that is
+# how a non-LinuxGSM host opts out.
+#
+# Plain KEY=VALUE (optionally quoted); the file is parsed, never sourced.
+
+LGSM_SCRIPT=/home/cs2server/cs2server
+LGSM_USER=cs2server
+GAMEINFO_PATH=/home/cs2server/serverfiles/game/csgo/gameinfo.gi
+CONSOLE_LOG=/home/cs2server/log/console/cs2server-console.log
+MATCHZY_CONFIG_PATH=/home/cs2server/serverfiles/game/csgo/cfg/MatchZy/config.cfg
+MATCHZY_CONFIG_OWNER=cs2server
+
+# Optional.
+# SNAPSHOT_KEEP=3       plugin snapshots kept in /var/lib/portal-gs-update/snapshots
+# VERIFY_TIMEOUT=90     seconds to wait for the plugin stack to load after a start
+# APPMANIFEST_PATH=     default: <serverfiles>/steamapps/appmanifest_730.acf

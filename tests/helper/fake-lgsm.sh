@@ -8,7 +8,6 @@
 #                         like LinuxGSM's OVERWRITE policy)
 #   fake/mods_rc          exit status of `mods-update`
 #   fake/next_lgsm        version `update-lgsm` moves to
-#   fake/send_rc          exit status of `send`
 #   fake/rotate           `start` begins a new console log (LinuxGSM does)
 #   fake/slow             `update` prints a line, then takes this many seconds
 #
@@ -42,9 +41,10 @@ boot() { # what CS2 prints when it starts with the files as they are now
         elif [ -e "$csgo/addons/SILENT" ]; then
             : # loads nothing and reports nothing
         else
-            echo "CounterStrikeSharp API v$(cat "$csgo/addons/counterstrikesharp/VERSION")"
-            echo "CounterStrikeSharp.API Loaded Successfully."
-            echo "[MatchZy $(cat "$csgo/addons/matchzy/VERSION") LOADED]"
+            # As the real console prints them, colour codes included.
+            printf '\033[38;5;10mCSSharp: \033[0mCounterStrikeSharp.API Loaded Successfully.\033[0m\n'
+            printf '\033[32m[MatchZy %s LOADED] MatchZy by WD- (https://github.com/shobhit-pathak/) [build 5fd0271, CounterStrikeSharp API %s, Ubuntu 24.04.5 LTS]\033[0m\n' \
+                "$(cat "$csgo/addons/matchzy/VERSION")" "$(cat "$csgo/addons/counterstrikesharp/VERSION")"
         fi
     } >>"$console"
 }
@@ -91,10 +91,6 @@ case ${1:-} in
     start | restart)
         echo running >"$fake/running"
         boot
-        ;;
-    send)
-        echo "${2:-}" >>"$fake/sent"
-        exit "$(cat "$fake/send_rc" 2>/dev/null || echo 0)"
         ;;
     *)
         echo "unknown command: ${1:-}" >&2

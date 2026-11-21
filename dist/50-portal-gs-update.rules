@@ -2,13 +2,14 @@
 //
 // The agent runs unprivileged (NoNewPrivileges, no sudo). This is its one
 // privilege: starting the update helper's template unit, and only with an
-// operation from the closed list. It cannot stop, restart, enable or edit
+// operation from the closed list (verify-config only reads the MatchZy
+// config and reports whether the managed blocks are in place). It cannot stop, restart, enable or edit
 // those units, and cannot touch any other unit.
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.systemd1.manage-units" &&
         subject.user == "portal-agent" &&
         action.lookup("verb") == "start" &&
-        /^portal-gs-update@(check|lgsm|game|mods|all|repair-config)\.service$/.test(action.lookup("unit"))) {
+        /^portal-gs-update@(check|lgsm|game|mods|all|repair-config|verify-config)\.service$/.test(action.lookup("unit"))) {
         return polkit.Result.YES;
     }
 });

@@ -187,6 +187,9 @@ async fn connect_and_serve(
     {
         return Ok(());
     }
+    // Have the helper look at the MatchZy config now, so the heartbeats of
+    // this connection report it from a fresh reading.
+    updater.verify_config(true, Instant::now()).await;
 
     // Whatever the watcher queued while we were disconnected: progress from
     // back then is stale (the job may be long over), the rest still counts.
@@ -239,46 +242,33 @@ const STATUS_OUTPUT_MAX: usize = 8 * 1024;
 
 async fn heartbeat_frame(config: &RunConfig, updater: &Updater) -> serde_json::Value {
     let mut frame = status_frame(config).await;
-    let rcon_ok = frame["rcon_ok"] == true;
-    let wired = if rcon_ok {
-        read_demo_upload_wired(config, updater).await
-    } else {
-        None
-    };
-    // Someone ran `mods-update` by hand and the demo-upload block is gone:
-    // put it back now rather than lose demos until an admin notices. It
-    // restarts nothing, and the job is reported like any other (trigger
-    // `auto_repair`).
-    if updater.claim_auto_repair(wired, Instant::now()) {
+    let now = Instant::now();
+    // What the helper last found in the MatchZy config file.
+    let health = updater.config_health();
+    // Someone ran `mods-update` by hand and the demo-upload block is gone
+    // (or the portal's overrides are not in the file): put it back now
+    // rather than lose demos until an admin notices. It restarts nothing,
+    // and the job is reported like any other (trigger `auto_repair`).
+    if updater.claim_auto_repair(health, now) {
         let job_id = update::new_job_id();
-        tracing::warn!(%job_id, "demo upload is not wired on the running server; starting repair-config");
+        tracing::warn!(
+            %job_id,
+            demo_upload_wired = ?health.demo_upload_wired,
+            overrides_applied = ?health.overrides_applied,
+            "managed MatchZy config blocks are not in place; starting repair-config"
+        );
         if let Err(e) = updater.start("repair-config", &job_id, "auto_repair").await {
             tracing::warn!(error = %e, "could not start the automatic config repair");
         }
+    } else {
+        // Keep the reading fresh (every 5 minutes, never during a job).
+        updater.verify_config(false, now).await;
     }
     frame["capabilities"] = json!(updater.capabilities());
-    frame["demo_upload_wired"] = json!(wired);
+    frame["demo_upload_wired"] = json!(health.demo_upload_wired);
+    frame["overrides_applied"] = json!(health.overrides_applied);
     frame["update_job"] = json!(updater.running_job());
     frame
-}
-
-/// Is demo upload wired on the running server? Compares the live cvars with
-/// the enrollment snippet. `None`: no snippet on this host, RCON failed, or
-/// the server did not answer with a cvar value (plugin stack not loaded).
-/// The header value reply contains the token; it is checked for presence
-/// inside `update::demo_upload_wired` and never logged or sent.
-async fn read_demo_upload_wired(config: &RunConfig, updater: &Updater) -> Option<bool> {
-    let snippet = std::fs::read_to_string(&updater.paths().snippet).ok()?;
-    let expected = update::parse_snippet(&snippet)?;
-    let read = async |cvar: &str| {
-        rcon::exec(&config.rcon_addr, &config.rcon_password, cvar)
-            .await
-            .ok()
-    };
-    let url = read("matchzy_demo_upload_url").await?;
-    let header_key = read("matchzy_demo_upload_header_key").await?;
-    let header_value = read("matchzy_demo_upload_header_value").await?;
-    update::demo_upload_wired(&expected, &url, &header_key, &header_value)
 }
 
 async fn status_frame(config: &RunConfig) -> serde_json::Value {

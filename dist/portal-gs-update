@@ -2,6 +2,13 @@
 # portal-gs-update — the only thing on a game host that drives LinuxGSM.
 #
 #   portal-gs-update check | lgsm | game | mods | all | repair-config
+#   portal-gs-update verify-config
+#
+# `verify-config` is not a job: it only reads the MatchZy config and writes
+# /run/portal-gs-update/config.json (is demo upload wired, are the portal's
+# overrides applied). It never touches state.json and steps aside (exit 75,
+# silently) when a job holds the lock; every job refreshes config.json itself
+# when it ends.
 #
 # Runs as root: from portal-gs-update@<op>.service (started by the agent
 # through polkit), from the nightly cron (`portal-gs-update game`) or by hand
@@ -82,7 +89,7 @@ STATE_OPEN=0 FINISHED=0
 USE_LOGGER=0
 
 usage() {
-    echo "usage: $PROG check|lgsm|game|mods|all|repair-config" >&2
+    echo "usage: $PROG check|lgsm|game|mods|all|repair-config|verify-config" >&2
     exit "$EX_USAGE"
 }
 
@@ -233,7 +240,7 @@ ensure_dirs() {
     chmod 0700 "$STATE_DIR/snapshots"
 }
 
-acquire_lock() {
+acquire_lock() { # acquire_lock [quiet] — quiet: no message when the lock is held
     local lock="$RUN_DIR/lock"
     # The directory is writable by the agent's group. A link or a file we do
     # not own was not put there by us: remove it rather than open it.
@@ -249,6 +256,7 @@ acquire_lock() {
     fi
     exec 9<"$lock" || die "$EX_FAILED" "cannot open $lock"
     if ! flock -n 9; then
+        [ "${1:-}" != quiet ] || exit "$EX_BUSY"
         die "$EX_BUSY" "another $PROG operation is running (lock held)"
     fi
 }
@@ -381,6 +389,8 @@ finish() { # finish <status> [error] — terminal; never returns
         atomic_install "$RUN_DIR/state.json" "$STATE_DIR/last-job.json" \
             || echo "$PROG: could not record last-job.json" >&2
     fi
+    # Whatever this job did to the MatchZy config, say where it stands now.
+    write_config_json || echo "$PROG: could not write config.json" >&2
     case $status in
         succeeded) code=0 ;;
         rolled_back) code=$EX_ROLLED_BACK ;;
@@ -521,7 +531,9 @@ latest_lookup() { # latest_lookup lgsm|metamod|cssharp|matchzy
     fi
     case $key in
         lgsm) val=$(fetch "$GITHUB_API/repos/GameServerManagers/LinuxGSM/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null) ;;
-        cssharp) val=$(fetch "$GITHUB_API/repos/roflmuffin/CounterStrikeSharp/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null | strip_v) ;;
+        # Releases are tagged v1.0.<api>; the server only ever reports the
+        # API number ("CounterStrikeSharp API 380"), so compare on that.
+        cssharp) val=$(fetch "$GITHUB_API/repos/roflmuffin/CounterStrikeSharp/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null | sed -E 's/^[vV]?[0-9]+\.[0-9]+\.//') ;;
         matchzy) val=$(fetch "$GITHUB_API/repos/shobhit-pathak/MatchZy/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null | strip_v) ;;
         metamod) val=$(fetch "$MMS_LATEST_URL" | head -n 1 | tr -d '[:space:]') ;;
     esac
@@ -789,6 +801,73 @@ render_overrides() { # → $WORK/overrides.lines (`cvar "value"` per line)
         printf '%s "%s"\n' "$name" "$value" >>"$out"
     done <"$raw"
     rm -f -- "$raw"
+}
+
+lines_after() { # lines_after <end marker> < config — what follows the last such line
+    awk -v e="$1" '
+        { line = $0; sub(/\r$/, "", line) }
+        line == e { found = 1; buf = ""; next }
+        found { buf = buf $0 "\n" }
+        END { printf "%s", buf }'
+}
+
+# File-level truth about the managed blocks, for the agent's heartbeat:
+# /run/portal-gs-update/config.json. (The running server cannot be asked:
+# MatchZy's settings are console commands, not cvars, and read back empty.)
+#   demo_upload_wired  true: the block is there, byte-identical to the
+#                      enrollment snippet, and no later line sets a
+#                      matchzy_demo_upload_* command over it. null: no snippet.
+#   overrides_applied  same for the overrides block against the overrides
+#                      file. null: no overrides file.
+# Reads only; never prints the token.
+write_config_json() {
+    local cur="$WORK/cfgv.cur" body="$WORK/cfgv.body" wired=null applied=null reason='' name tmp
+    read_config "$cur" 2>/dev/null || : >"$cur"
+    if have_snippet; then
+        if ! block_body "$DEMO_BEGIN" "$DEMO_END" <"$cur" >"$body" 2>/dev/null || ! cmp -s "$body" "$WORK/snippet"; then
+            wired=false
+            reason='the demo-upload block is missing from the MatchZy config or differs from the enrollment snippet'
+        elif lines_after "$DEMO_END" <"$cur" | grep -qiE '^[[:space:]]*matchzy_demo_upload_'; then
+            wired=false
+            reason='a line after the demo-upload block sets a matchzy_demo_upload_* command and overrides it'
+        else
+            wired=true
+        fi
+    else
+        reason='no enrollment snippet on this host'
+    fi
+    if [ -e "$OVERRIDES" ]; then
+        render_overrides
+        applied=true
+        if [ -s "$WORK/overrides.lines" ]; then
+            block_body "$OVR_BEGIN" "$OVR_END" <"$cur" >"$body" 2>/dev/null || : >"$body"
+            if ! cmp -s "$body" "$WORK/overrides.lines"; then
+                applied=false
+            else
+                lines_after "$OVR_END" <"$cur" >"$body"
+                while IFS=' ' read -r name _; do
+                    if grep -qE "^[[:space:]]*${name}([[:space:]]|\$)" "$body"; then
+                        applied=false
+                    fi
+                done <"$WORK/overrides.lines"
+            fi
+        elif block_body "$OVR_BEGIN" "$OVR_END" <"$cur" >/dev/null 2>&1; then
+            applied=false # the portal cleared its overrides; the block is still there
+        fi
+        if [ "$applied" = false ] && [ "$wired" != false ]; then
+            reason='the MatchZy overrides block is missing, out of date or overridden by a later line'
+        fi
+    fi
+    rm -f -- "$cur" "$body"
+    tmp=$(mktemp "$RUN_DIR/.config.XXXXXX") || return 1
+    if jq -n --arg at "$(now_iso)" --argjson w "$wired" --argjson a "$applied" --arg r "$reason" '{
+            checked_at: $at, demo_upload_wired: $w, overrides_applied: $a,
+            reason: (if $r == "" then null else $r end)
+        }' >"$tmp" && chmod 0644 "$tmp" && mv -fT "$tmp" "$RUN_DIR/config.json"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
 }
 
 CONFIG_CHANGED=0
@@ -1161,16 +1240,11 @@ op_repair_config() {
     st '.config_report = {cvars_changed: [], cvars_removed: [], cvars_added: [],
             files_changed: (if .config_changed then [$f] else [] end)}' --arg f "${MATCHZY_CONFIG_PATH##*/}"
     record_block_state
-    phase reload
-    # Make the running server pick the block up without a restart. If the
-    # console send does not work (server down, tmux quirk) say so: the agent
-    # then runs the same exec over local RCON.
-    if run_lgsm send "exec ${MZ_REL#cfg/}/${MATCHZY_CONFIG_PATH##*/}"; then
-        st '.needs_reload = false'
-    else
-        log "console send failed - leaving needs_reload for the agent"
-        st '.needs_reload = true'
-    fi
+    # The file is right; the running server has not read it. The helper has
+    # no dependable way to tell it (it has no RCON, and LinuxGSM's console
+    # `send` is not something to bet demos on), so the agent does: on
+    # needs_reload it runs `exec MatchZy/config.cfg` over its local RCON.
+    st '.needs_reload = true'
     finish succeeded
 }
 
@@ -1179,13 +1253,24 @@ op_repair_config() {
 [ "$#" -eq 1 ] || usage
 OP=$1
 case $OP in
-    check | lgsm | game | mods | all | repair-config) ;;
+    check | lgsm | game | mods | all | repair-config | verify-config) ;;
     *) usage ;;
 esac
 
 load_conf
 check_deps
 ensure_dirs
+
+if [ "$OP" = verify-config ]; then
+    # Not a job: no request, no state.json, and never in a job's way.
+    acquire_lock quiet
+    trap on_exit EXIT
+    WORK=$(mktemp -d "$STATE_DIR/.work.XXXXXX") || die "$EX_FAILED" "cannot create a work directory in $STATE_DIR"
+    chmod 0700 "$WORK"
+    write_config_json || die "$EX_FAILED" "could not write $RUN_DIR/config.json"
+    exit 0
+fi
+
 acquire_lock
 read_request
 

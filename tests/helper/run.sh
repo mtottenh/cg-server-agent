@@ -37,6 +37,7 @@ eq() { # eq <what> <expected> <actual>
 }
 st() { jq -r "$@" "$RUN/state.json"; }
 st_eq() { eq "state $1" "$2" "$(st "$1")"; }
+cfg_eq() { eq "config.json $1" "$2" "$(jq -r "$1" "$RUN/config.json" 2>/dev/null)"; }
 has() { # has <file> <fixed string>
     grep -qF -- "$2" "$1" || bad "$1 should contain: $2"
 }
@@ -48,7 +49,7 @@ calls() { tr '\n' ',' <"$FAKE/calls"; }
 # No secret may reach anything the helper publishes or prints.
 no_secrets() {
     local f
-    for f in "$RUN"/state.json "$STATE"/*.json "$OUT"; do
+    for f in "$RUN"/state.json "$RUN"/config.json "$STATE"/*.json "$OUT"; do
         [ -f "$f" ] || continue
         hasnt "$f" "$TOKEN"
         hasnt "$f" 'Bearer '
@@ -87,7 +88,7 @@ setup() {
     # gameinfo.gi has CRLF line endings, like the real one.
     printf '"GameInfo"\r\n{\r\n\tFileSystem\r\n\t{\r\n\t\tSearchPaths\r\n\t\t{\r\n\t\t\tGame_LowViolence\tcsgo_lv\r\n\t\t\tGame\tcsgo/addons/metamod\r\n\t\t\tGame\tcsgo\r\n\t\t\tGame\tcsgo_imported\r\n\t\t}\r\n\t}\r\n}\r\n' >"$CSGO/gameinfo.gi"
 
-    echo 1.0.370 >"$CSGO/addons/counterstrikesharp/VERSION"
+    echo 370 >"$CSGO/addons/counterstrikesharp/VERSION"
     echo 0.9.2 >"$CSGO/addons/matchzy/VERSION"
     echo 'addons/counterstrikesharp' >"$CSGO/addons/metamod/metaplugins.ini"
 
@@ -115,7 +116,7 @@ setup() {
     # pristine config (no block, operator changes gone).
     mkdir -p "$FAKE/mods_next/addons/matchzy" "$FAKE/mods_next/addons/counterstrikesharp" "$FAKE/mods_next/cfg/MatchZy"
     echo 0.9.3 >"$FAKE/mods_next/addons/matchzy/VERSION"
-    echo 1.0.380 >"$FAKE/mods_next/addons/counterstrikesharp/VERSION"
+    echo 380 >"$FAKE/mods_next/addons/counterstrikesharp/VERSION"
     echo new >"$FAKE/mods_next/addons/matchzy/NewFile.dll"
     printf '%s\n' \
         '// MatchZy config' \
@@ -129,8 +130,9 @@ setup() {
     echo 'mp_warmuptime 60' >"$FAKE/mods_next/cfg/MatchZy/warmup.cfg"
 
     # The server is up, plugins loaded, from an earlier start.
-    printf '%s\n' 'Loading map' 'CounterStrikeSharp API v1.0.370' \
-        'CounterStrikeSharp.API Loaded Successfully.' '[MatchZy 0.9.2 LOADED]' >"$GS/log/console/cs2server-console.log"
+    printf 'Loading map\n\033[38;5;10mCSSharp: \033[0mCounterStrikeSharp.API Loaded Successfully.\033[0m\n\033[32m[MatchZy 0.9.2 LOADED] MatchZy by WD- (https://github.com/shobhit-pathak/) [build 0000000, CounterStrikeSharp API 370, Ubuntu 24.04.5 LTS]\033[0m\n' \
+        >"$GS/log/console/cs2server-console.log"
+    : >"$FAKE/calls"
 
     snippet_text >"$T/etc/matchzy_portal.cfg"
     cat >"$T/etc/gs-update.conf" <<EOF
@@ -219,13 +221,13 @@ test_check_reports_installed_and_latest() {
     st_eq .phase done
     st_eq .before.lgsm v26.6.0
     st_eq .before.cs2_build 1000
-    st_eq .before.cssharp 1.0.370
+    st_eq .before.cssharp 370
     st_eq .before.matchzy 0.9.2
     st_eq .before.metamod null
     st_eq .latest.lgsm v26.7.0
     st_eq .latest.cs2_build 2000
     st_eq .latest.metamod mmsource-2.0.0-git1491-linux.tar.gz
-    st_eq .latest.cssharp 1.0.380
+    st_eq .latest.cssharp 380
     st_eq .latest.matchzy 0.9.3
     st_eq .load.cssharp true
     st_eq .load.matchzy true
@@ -285,7 +287,10 @@ test_mods_update_reasserts_block_and_reports_config() {
     st_eq .load.matchzy true
     st_eq .before.matchzy 0.9.2
     st_eq .after.matchzy 0.9.3
-    st_eq .after.cssharp 1.0.380
+    st_eq .after.cssharp 380
+    eq "installed.json cssharp" 380 "$(jq -r .cssharp "$STATE/installed.json")"
+    cfg_eq .demo_upload_wired true
+    cfg_eq .overrides_applied true
     eq "calls" 'stop,mods-update,start,' "$(calls)"
     eq "new plugin files landed" 0.9.3 "$(cat "$CSGO/addons/matchzy/VERSION")"
 
@@ -456,10 +461,11 @@ test_repair_config_is_idempotent() {
     st_eq .config_changed true
     st_eq .demo_upload_block_present true
     st_eq .restarted false
-    st_eq .needs_reload false
+    # The agent reloads the config over RCON; the helper only says so.
+    st_eq .needs_reload true
     eq "files_changed" config.cfg "$(st '.config_report.files_changed | join(",")')"
-    eq "calls" 'send exec MatchZy/config.cfg,' "$(calls)"
-    eq "reload sent" 'exec MatchZy/config.cfg' "$(cat "$FAKE/sent")"
+    eq "calls (LinuxGSM is not involved)" '' "$(calls)"
+    cfg_eq .demo_upload_wired true
     eq "config mode" 640 "$(stat -c %a "$CFG")"
     blockinfile_converge "$CFG" "$T/etc/matchzy_portal.cfg" >"$T/converged.cfg"
     cmp -s "$T/converged.cfg" "$CFG" || bad "an Ansible blockinfile converge would change the file"
@@ -506,16 +512,145 @@ test_repair_config_moves_a_stale_block_and_keeps_operator_lines() {
     hasnt "$RUN/state.json" tok_STALE
 }
 
-test_repair_config_flags_reload_when_send_fails() {
-    echo 1 >"$FAKE/send_rc"
+test_repair_config_without_a_snippet_invents_nothing() {
     rm "$T/etc/matchzy_portal.cfg"
     cp "$FAKE/mods_next/cfg/MatchZy/config.cfg" "$CFG"
     helper repair-config
     eq "exit status" 0 "$RC"
-    st_eq .needs_reload true
-    # No enrollment snippet: nothing to assert, nothing invented.
     st_eq .demo_upload_block_present false
     st_eq .config_changed false
+    cfg_eq .demo_upload_wired null
+    cfg_eq .reason 'no enrollment snippet on this host'
+}
+
+test_verify_config_reports_wiring_from_the_file() {
+    helper verify-config
+    eq "exit status" 0 "$RC"
+    eq "prints nothing" '' "$(cat "$OUT")"
+    cfg_eq .demo_upload_wired true
+    cfg_eq .overrides_applied null
+    cfg_eq .reason null
+    [[ $(jq -r .checked_at "$RUN/config.json") =~ ^20[0-9-]+T[0-9:]+Z$ ]] || bad "checked_at is not a timestamp"
+    eq "config.json mode" 644 "$(stat -c %a "$RUN/config.json")"
+    eq "keys" 'checked_at,demo_upload_wired,overrides_applied,reason' "$(jq -r 'keys | join(",")' "$RUN/config.json")"
+    # Not a job: no state, no record, LinuxGSM never called, nothing left behind.
+    [ ! -e "$RUN/state.json" ] || bad "verify-config must not write state.json"
+    [ ! -e "$STATE/last-job.json" ] || bad "verify-config must not write last-job.json"
+    eq "calls" '' "$(calls)"
+    eq "work dirs left" 0 "$(find "$STATE" -maxdepth 1 -name '.work.*' | wc -l)"
+
+    # mods-update by hand: the block is gone.
+    cp "$FAKE/mods_next/cfg/MatchZy/config.cfg" "$CFG"
+    helper verify-config
+    cfg_eq .demo_upload_wired false
+    [[ $(jq -r .reason "$RUN/config.json") == *'missing from the MatchZy config or differs'* ]] || bad "reason: $(jq -r .reason "$RUN/config.json")"
+    # repair-config fixes it and refreshes config.json on its way out.
+    helper repair-config
+    cfg_eq .demo_upload_wired true
+    cfg_eq .reason null
+
+    # Right block, wrong token: differs from the snippet.
+    sed -i "s/$TOKEN/tok_STALE/" "$CFG"
+    helper verify-config
+    cfg_eq .demo_upload_wired false
+    helper repair-config
+
+    # Block intact, but a later line switches upload off again.
+    echo 'matchzy_demo_upload_url ""' >>"$CFG"
+    helper verify-config
+    cfg_eq .demo_upload_wired false
+    [[ $(jq -r .reason "$RUN/config.json") == *'after the demo-upload block'* ]] || bad "reason: $(jq -r .reason "$RUN/config.json")"
+    helper repair-config
+    cfg_eq .demo_upload_wired true
+    # A later line about something else, or a comment, is the operator's business.
+    printf '%s\n' '// matchzy_demo_upload_url ""' 'matchzy_autostart_mode 1' >>"$CFG"
+    helper verify-config
+    cfg_eq .demo_upload_wired true
+
+    # No config file at all.
+    rm "$CFG"
+    helper verify-config
+    eq "exit status (no config)" 0 "$RC"
+    cfg_eq .demo_upload_wired false
+
+    # No snippet: nothing to compare against.
+    rm "$T/etc/matchzy_portal.cfg"
+    helper verify-config
+    cfg_eq .demo_upload_wired null
+    cfg_eq .reason 'no enrollment snippet on this host'
+    no_secrets
+    hasnt "$RUN/config.json" "$TOKEN"
+    hasnt "$RUN/config.json" tok_STALE
+}
+
+test_verify_config_reports_overrides() {
+    helper verify-config
+    cfg_eq .overrides_applied null
+    echo 'matchzy_minimum_ready_required 5' >"$T/etc/matchzy_overrides.cfg"
+    helper verify-config
+    cfg_eq .overrides_applied false
+    cfg_eq .demo_upload_wired true
+    [[ $(jq -r .reason "$RUN/config.json") == *'overrides block'* ]] || bad "reason: $(jq -r .reason "$RUN/config.json")"
+    helper repair-config
+    cfg_eq .overrides_applied true
+    cfg_eq .reason null
+    # The portal changed a value: the block is out of date.
+    echo 'matchzy_minimum_ready_required 4' >"$T/etc/matchzy_overrides.cfg"
+    helper verify-config
+    cfg_eq .overrides_applied false
+    helper repair-config
+    cfg_eq .overrides_applied true
+    # A later line sets the same command: the override does not hold.
+    echo 'matchzy_minimum_ready_required 1' >>"$CFG"
+    helper verify-config
+    cfg_eq .overrides_applied false
+    helper repair-config
+    # A longer name is a different command.
+    echo 'matchzy_minimum_ready_required_extra 1' >>"$CFG"
+    helper verify-config
+    cfg_eq .overrides_applied true
+    # Overrides cleared in the portal: applied once the block is gone.
+    : >"$T/etc/matchzy_overrides.cfg"
+    helper verify-config
+    cfg_eq .overrides_applied false
+    helper repair-config
+    cfg_eq .overrides_applied true
+}
+
+test_verify_config_steps_aside_for_a_running_job() {
+    helper mods
+    cp "$RUN/state.json" "$T/state.before"
+    cp "$RUN/config.json" "$T/config.before"
+    cp "$STATE/last-job.json" "$T/last.before"
+    cp "$FAKE/mods_next/cfg/MatchZy/config.cfg" "$CFG" # would flip the answer
+    flock "$RUN/lock" sleep 1 &
+    local holder=$!
+    sleep 0.3
+    helper verify-config
+    eq "exit status" 75 "$RC"
+    eq "prints nothing" '' "$(cat "$OUT")"
+    cmp -s "$T/config.before" "$RUN/config.json" || bad "config.json must be untouched while a job runs"
+    wait "$holder"
+    helper verify-config
+    eq "exit status (lock free)" 0 "$RC"
+    cfg_eq .demo_upload_wired false
+    cmp -s "$T/state.before" "$RUN/state.json" || bad "verify-config must not touch state.json"
+    cmp -s "$T/last.before" "$STATE/last-job.json" || bad "verify-config must not touch last-job.json"
+}
+
+test_every_job_refreshes_config_json() {
+    local op
+    for op in check game lgsm; do
+        rm -f "$RUN/config.json"
+        helper "$op"
+        cfg_eq .demo_upload_wired true
+    done
+    # A rolled-back mods run too: the old files, block included, are back.
+    touch "$FAKE/mods_next/addons/BROKEN"
+    rm -f "$RUN/config.json"
+    helper mods
+    st_eq .status rolled_back
+    cfg_eq .demo_upload_wired true
 }
 
 # What the agent relies on while a job runs: state.json says `running`,

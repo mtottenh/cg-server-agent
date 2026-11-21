@@ -101,6 +101,7 @@ sudo portal-gs-update game           # CS2 build + gameinfo.gi repair; restarts 
 sudo portal-gs-update mods           # Metamod / CounterStrikeSharp / MatchZy, with rollback
 sudo portal-gs-update all            # lgsm, then game and mods with one restart
 sudo portal-gs-update repair-config  # re-assert the managed MatchZy config blocks; no restart
+sudo portal-gs-update verify-config  # are those blocks in place? writes config.json; changes nothing
 ```
 
 **Opting in.** The helper does nothing until `/etc/portal/gs-update.conf`
@@ -128,17 +129,26 @@ end of that file:
   when the portal sends `set_matchzy_overrides`.
 
 Anything else an operator changed in the overwritten files is lost by the
-update; the job result lists it (`config_report`). The agent also checks the
-*running server's* demo-upload cvars on every heartbeat and, if someone ran
-`./cs2server mods-update` by hand and unwired them, starts `repair-config`
-itself (at most once per 10 minutes; it restarts nothing).
+update; the job result lists it (`config_report`).
+
+Whether the blocks are in place is checked **in the file**, by the helper
+(`verify-config`, and at the end of every job), which writes
+`/run/portal-gs-update/config.json`. The running server cannot be asked:
+MatchZy's settings are console commands, not cvars, and read back empty
+over RCON. The agent starts `verify-config` on every connect and every
+5 minutes, reports the result in its heartbeat, and — if someone ran
+`./cs2server mods-update` by hand and the demo-upload block is gone, or the
+portal's overrides are not in the file — starts `repair-config` itself (at
+most once per 10 minutes; it restarts nothing). After a `repair-config` the
+agent makes the running server re-read the file with
+`exec MatchZy/config.cfg` over its local RCON.
 
 **Privileges.** The agent stays unprivileged (`NoNewPrivileges`, no sudo, no
 access to `/home`). It starts `portal-gs-update@<operation>.service`
 through systemd; a polkit rule
 (`/usr/share/polkit-1/rules.d/50-portal-gs-update.rules`) allows the
-`portal-agent` user to *start* exactly those six instances and nothing
-else. The operation is the only input; the portal's job id travels in
+`portal-agent` user to *start* exactly those seven instances (the six
+operations and `verify-config`) and nothing else. The operation is the only input; the portal's job id travels in
 `/run/portal-gs-update/request.json`. The job runs outside the agent, so it
 survives an agent restart or upgrade and a dropped connection.
 
@@ -146,6 +156,7 @@ survives an agent restart or upgrade and a dropped connection.
 |---|---|---|
 | `/etc/portal/gs-update.conf` | config management | where LinuxGSM lives; presence = opted in |
 | `/run/portal-gs-update/state.json` | helper | the current/last operation, rewritten at every phase |
+| `/run/portal-gs-update/config.json` | helper | `{checked_at, demo_upload_wired, overrides_applied, reason}` — the managed blocks as found in the MatchZy config |
 | `/run/portal-gs-update/request.json` | agent | `{job_id, operation, trigger}` for the unit about to start |
 | `/run/portal-gs-update/lock` | helper | one operation at a time (a second one exits 75) |
 | `/var/lib/portal-gs-update/check.json` | helper | last `check` |
@@ -264,6 +275,7 @@ Every 30 s:
   "status_output": "…",
   "capabilities": ["lgsm_update"],
   "demo_upload_wired": true,
+  "overrides_applied": null,
   "update_job": {"job_id": "…", "operation": "mods", "phase": "verify", "status": "running"}
 }
 ```
@@ -274,13 +286,20 @@ Every 30 s:
 - `capabilities` (0.3.0+) — `["lgsm_update"]` when both
   `/etc/portal/gs-update.conf` and `/usr/sbin/portal-gs-update` exist,
   otherwise `[]`.
-- `demo_upload_wired` (0.3.0+) — `true` when the running server's
-  `matchzy_demo_upload_url` and `matchzy_demo_upload_header_key` equal the
-  enrollment snippet's and `matchzy_demo_upload_header_value` is non-empty;
-  `false` when all three were read and something differs; `null` when it
-  cannot be told: no snippet on this host, RCON down, or the server did not
-  answer with a cvar value (plugin stack not loaded). The header value is
-  only tested for emptiness — it is never logged or sent.
+- `demo_upload_wired` (0.3.0+) — from the helper's last look at the MatchZy
+  config **file** (`config.json`; independent of `rcon_ok`). `true`: the
+  demo-upload block is present, byte-identical to the enrollment snippet,
+  and no later line sets a `matchzy_demo_upload_*` command over it.
+  `false`: the block is missing, differs, or is overridden. `null`: unknown
+  — no enrollment snippet on this host, no capability, or no report newer
+  than 15 minutes (the agent refreshes it on connect and every 5 minutes,
+  so `null` right after a connect clears within one heartbeat).
+- `overrides_applied` (0.3.0+) — same source. `true`: the overrides block
+  matches what `set_matchzy_overrides` last wrote and no later line sets
+  one of those commands; `false`: it does not; `null`: no overrides were
+  ever set on this host, or unknown as above.
+- When either is `false` the agent starts `repair-config` itself (trigger
+  `auto_repair`), at most once per 10 minutes and never while a job runs.
 - `update_job` (0.3.0+) — the operation in flight, or `null`. `phase` is
   `starting` between the agent starting the unit and the helper's first
   state write. `status` is always `running` here.
@@ -332,14 +351,14 @@ job is sent at once). Dropped, not queued, while the portal is unreachable.
   `update_status` and `update_progress`).
 - `phase`: `init`, `check`, `lgsm-update`, `snapshot`, `stop`,
   `game-update`, `mods-update`, `reconcile-config`, `gameinfo`, `start`,
-  `restart`, `verify`, `rollback`, `record`, `reload`, `done`; plus
+  `restart`, `verify`, `rollback`, `record`, `done`; plus
   `starting` (agent-side, before the helper has written anything). `done`
   only on success; otherwise it is where the job stopped, and
   `failed_phase` is the phase that broke (for `rolled_back`: the phase
   that triggered the rollback).
 - `trigger`: `portal` (`update_start`, `update_check`), `overrides`
   (`set_matchzy_overrides`), `auto_repair` (the agent found demo upload
-  unwired), `local` (cron or SSH). **The portal therefore receives results
+  unwired or the overrides not applied), `local` (cron or SSH). **The portal therefore receives results
   for job ids it did not create** — `local`, `auto_repair`, `overrides` —
   and must treat them as information, not errors. Delivery is at-least-once:
   key on `job_id`.
@@ -351,11 +370,13 @@ job is sent at once). Dropped, not queued, while the portal is unreachable.
   `error` is the `MMS: Fatal error` line if there was one. `null` when the
   job never restarted the server.
 - `demo_upload_block_present`: the block in `config.cfg` is identical to
-  the enrollment snippet (file-level; `demo_upload_wired` in the heartbeat
-  is the running-server check).
-- `needs_reload`: `repair-config` could not tell the running server to
-  re-read the config through the LinuxGSM console; the agent then runs
-  `exec MatchZy/config.cfg` over local RCON itself.
+  the enrollment snippet at the end of this job (`demo_upload_wired` in
+  the heartbeat additionally requires that nothing after it overrides it).
+- `needs_reload`: `true` on every successful `repair-config` — the file is
+  right but the running server has not re-read it. Informational: the
+  agent acts on it itself by running `exec MatchZy/config.cfg` over its
+  local RCON. `false` for every other operation (`mods` and `all` restart
+  the server, which reads the file).
 - `config_report`: what the update did to operator settings, with the
   managed blocks excluded. Values of `matchzy_demo_upload_*` and
   `matchzy_remote_*` are `"[redacted]"`. `null` for jobs that do not touch

@@ -40,8 +40,12 @@ const PENDING_TIMEOUT: Duration = Duration::from_secs(60);
 /// A `running` state whose helper process is gone for this long is dead
 /// (SIGKILL, OOM). The grace covers the helper's own final write + exit.
 const DEAD_HELPER_GRACE: Duration = Duration::from_secs(5);
-/// Auto-repair of the demo-upload block: at most once per this long.
+/// Auto-repair of the managed config blocks: at most once per this long.
 const AUTO_REPAIR_INTERVAL: Duration = Duration::from_secs(600);
+/// How often the agent asks the helper to re-check the MatchZy config.
+const VERIFY_INTERVAL: Duration = Duration::from_secs(300);
+/// A `config.json` older than this says nothing about the config now.
+const CONFIG_MAX_AGE: Duration = Duration::from_secs(900);
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(15);
 
 const MAX_OVERRIDES: usize = 64;
@@ -55,12 +59,11 @@ pub struct Paths {
     /// Helper config; its presence is how a host opts in.
     pub conf: PathBuf,
     pub helper: PathBuf,
-    /// Shared with the helper: `request.json` (ours), `state.json` (its).
+    /// Shared with the helper: `request.json` (ours), `state.json` and
+    /// `config.json` (its).
     pub run_dir: PathBuf,
     /// The helper's: `check.json`, `installed.json`, `last-job.json`.
     pub state_dir: PathBuf,
-    /// Enrollment snippet with the demo-upload cvars (holds the token).
-    pub snippet: PathBuf,
     /// Portal-managed MatchZy overrides, written here, read by the helper.
     pub overrides: PathBuf,
     pub systemctl: PathBuf,
@@ -76,7 +79,6 @@ impl Default for Paths {
             helper: "/usr/sbin/portal-gs-update".into(),
             run_dir: "/run/portal-gs-update".into(),
             state_dir: "/var/lib/portal-gs-update".into(),
-            snippet: "/etc/portal/agent/matchzy_portal.cfg".into(),
             overrides: "/etc/portal/agent/matchzy_overrides.cfg".into(),
             systemctl: "systemctl".into(),
             sent_marker: "/var/lib/portal-server-agent/last-sent-job".into(),
@@ -93,10 +95,30 @@ struct Pending {
     since: Instant,
 }
 
+/// What the helper last found in the MatchZy config file
+/// (`config.json`, written by `verify-config` and at the end of every job).
+/// Each is `None` when unknown: no report, a stale one, or nothing to
+/// compare against (no enrollment snippet / no overrides file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConfigHealth {
+    /// The demo-upload block is in place and nothing after it overrides it.
+    pub demo_upload_wired: Option<bool>,
+    /// The portal's MatchZy overrides are in the config.
+    pub overrides_applied: Option<bool>,
+}
+
+impl ConfigHealth {
+    /// Something is definitely wrong that `repair-config` fixes.
+    pub fn needs_repair(&self) -> bool {
+        self.demo_upload_wired == Some(false) || self.overrides_applied == Some(false)
+    }
+}
+
 pub struct Updater {
     paths: Paths,
     pending: Mutex<Option<Pending>>,
     last_auto_repair: Mutex<Option<Instant>>,
+    last_verify: Mutex<Option<Instant>>,
     /// In-memory copy of the sent marker (the file may be unwritable in dev).
     last_sent: Mutex<Option<String>>,
     /// A result that could not be sent and is recorded nowhere else.
@@ -254,107 +276,6 @@ pub fn render_overrides(overrides: &[(String, String)]) -> String {
         .collect()
 }
 
-// --- demo-upload wiring ------------------------------------------------------
-
-/// What the running server must have for demo upload to work, from the
-/// enrollment snippet. The header value (the token) is deliberately not
-/// kept: all we ever check about it is that the server has *something*.
-#[derive(Debug, PartialEq, Eq)]
-pub struct DemoUploadExpectation {
-    pub url: String,
-    pub header_key: String,
-}
-
-fn unquote(s: &str) -> &str {
-    let s = s.trim();
-    s.strip_prefix('"')
-        .and_then(|r| r.strip_suffix('"'))
-        .unwrap_or(s)
-}
-
-/// Read `matchzy_demo_upload_url` / `_header_key` out of the snippet.
-pub fn parse_snippet(text: &str) -> Option<DemoUploadExpectation> {
-    let mut url = None;
-    let mut header_key = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with("//") {
-            continue;
-        }
-        let Some((name, value)) = line.split_once(char::is_whitespace) else {
-            continue;
-        };
-        match name {
-            "matchzy_demo_upload_url" => url = Some(unquote(value).to_string()),
-            "matchzy_demo_upload_header_key" => header_key = Some(unquote(value).to_string()),
-            _ => {}
-        }
-    }
-    Some(DemoUploadExpectation {
-        url: url.filter(|u| !u.is_empty())?,
-        header_key: header_key.filter(|k| !k.is_empty())?,
-    })
-}
-
-/// The value a console reply reports for cvar `name`, if the reply is a
-/// cvar read-out at all. Accepts the shapes Source and CounterStrikeSharp
-/// print: `name = value`, `"name" = "value" ( def. "" )`, `name: value`,
-/// `name is "value"`. Anything else (`Unknown command`, silence) is `None`:
-/// "could not tell", which must never be mistaken for "not set".
-pub fn parse_cvar_reply(reply: &str, name: &str) -> Option<String> {
-    for line in reply.lines() {
-        let line = line.trim();
-        let line = line.strip_prefix('"').unwrap_or(line);
-        let Some(head) = line.get(..name.len()) else {
-            continue;
-        };
-        if !head.eq_ignore_ascii_case(name) {
-            continue;
-        }
-        let rest = &line[name.len()..];
-        let rest = rest.strip_prefix('"').unwrap_or(rest);
-        let trimmed = rest.trim_start();
-        let after = if let Some(r) = trimmed.strip_prefix('=') {
-            r
-        } else if let Some(r) = trimmed.strip_prefix(':') {
-            r
-        } else if let Some(r) = trimmed.strip_prefix("is ") {
-            r
-        } else {
-            // `name_longer = …` or prose that merely starts with the name.
-            continue;
-        };
-        let after = after.trim();
-        if let Some(quoted) = after.strip_prefix('"') {
-            return Some(match quoted.find('"') {
-                Some(end) => quoted[..end].to_string(),
-                None => quoted.to_string(),
-            });
-        }
-        // Unquoted: drop a trailing `( def. … )` annotation.
-        let value = after.split(" ( def.").next().unwrap_or(after).trim();
-        return Some(value.to_string());
-    }
-    None
-}
-
-/// Is demo upload wired on the running server? `Some(true)` only when the
-/// URL and header key match the snippet and a header value is set;
-/// `Some(false)` when all three could be read and something is off; `None`
-/// when any of them could not be read. The header value reply holds the
-/// token: it is inspected here and goes nowhere else.
-pub fn demo_upload_wired(
-    expected: &DemoUploadExpectation,
-    url_reply: &str,
-    header_key_reply: &str,
-    header_value_reply: &str,
-) -> Option<bool> {
-    let url = parse_cvar_reply(url_reply, "matchzy_demo_upload_url")?;
-    let key = parse_cvar_reply(header_key_reply, "matchzy_demo_upload_header_key")?;
-    let value = parse_cvar_reply(header_value_reply, "matchzy_demo_upload_header_value")?;
-    Some(url == expected.url && key == expected.header_key && !value.trim().is_empty())
-}
-
 // --- state file → frames -----------------------------------------------------
 
 /// What the watcher hands the connection loop.
@@ -506,13 +427,10 @@ impl Updater {
             paths,
             pending: Mutex::new(None),
             last_auto_repair: Mutex::new(None),
+            last_verify: Mutex::new(None),
             last_sent: Mutex::new(last_sent),
             undelivered: Mutex::new(None),
         }
-    }
-
-    pub fn paths(&self) -> &Paths {
-        &self.paths
     }
 
     /// `["lgsm_update"]` when both the helper and its config exist.
@@ -753,11 +671,56 @@ impl Updater {
         Some(last)
     }
 
-    /// Should the agent repair the demo-upload block on its own right now?
-    /// Only on a definite "not wired", only when idle, at most once per
-    /// `AUTO_REPAIR_INTERVAL`. Claims the slot when it says yes.
-    pub fn claim_auto_repair(&self, wired: Option<bool>, now: Instant) -> bool {
-        if wired != Some(false) || !self.capable() || self.running_job().is_some() {
+    /// The helper's last word on the MatchZy config. The running server
+    /// cannot be asked instead: MatchZy's settings are console commands, not
+    /// cvars, and read back empty over RCON.
+    pub fn config_health(&self) -> ConfigHealth {
+        let path = self.paths.run_dir.join("config.json");
+        let fresh = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|at| at.elapsed().ok())
+            // A timestamp in the future (clock stepped back) is not stale.
+            .is_none_or(|age| age <= CONFIG_MAX_AGE);
+        let Some(report) = read_json(&path).filter(|_| fresh) else {
+            return ConfigHealth::default();
+        };
+        ConfigHealth {
+            demo_upload_wired: report.get("demo_upload_wired").and_then(Value::as_bool),
+            overrides_applied: report.get("overrides_applied").and_then(Value::as_bool),
+        }
+    }
+
+    /// Ask the helper to re-read the MatchZy config (`verify-config`), if it
+    /// is due: on every connect (`force`) and every `VERIFY_INTERVAL`. Never
+    /// while a job runs — the job refreshes `config.json` itself when it
+    /// ends. Not a job: no request file, no claim, no result frame.
+    pub async fn verify_config(&self, force: bool, now: Instant) -> bool {
+        if !self.capable() || self.running_job().is_some() {
+            return false;
+        }
+        {
+            let mut last = self.last_verify.lock().unwrap();
+            if !force && last.is_some_and(|at| now.duration_since(at) < VERIFY_INTERVAL) {
+                return false;
+            }
+            *last = Some(now);
+        }
+        match self.systemctl_start("verify-config").await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not start the MatchZy config check");
+                false
+            }
+        }
+    }
+
+    /// Should the agent run `repair-config` on its own right now? Only when
+    /// the helper found a managed block definitely missing or overridden,
+    /// only when idle, at most once per `AUTO_REPAIR_INTERVAL`. Claims the
+    /// slot when it says yes.
+    pub fn claim_auto_repair(&self, health: ConfigHealth, now: Instant) -> bool {
+        if !health.needs_repair() || !self.capable() || self.running_job().is_some() {
             return false;
         }
         let mut last = self.last_auto_repair.lock().unwrap();
@@ -844,7 +807,6 @@ mod tests {
                 helper: root.join("sbin/portal-gs-update"),
                 run_dir: root.join("run"),
                 state_dir: root.join("state"),
-                snippet: root.join("etc/agent/matchzy_portal.cfg"),
                 overrides: root.join("etc/agent/matchzy_overrides.cfg"),
                 systemctl: "true".into(),
                 sent_marker: root.join("agent-state/last-sent-job"),
@@ -1041,124 +1003,6 @@ mod tests {
         assert!(host.updater().capabilities().is_empty(), "config alone");
         std::fs::write(&host.paths.helper, "#!/bin/sh\n").unwrap();
         assert_eq!(host.updater().capabilities(), vec!["lgsm_update"]);
-    }
-
-    // --- demo-upload wiring --------------------------------------------------
-
-    const SNIPPET: &str = "// Written by portal-server-agent enroll. Server-scoped demo\n\
-        // upload settings for csgo/cfg/MatchZy/config.cfg — do NOT\n\
-        // put these in per-match cvars.\n\
-        matchzy_demo_upload_url \"https://portal.example/v1/demos\"\n\
-        matchzy_demo_upload_header_key \"Authorization\"\n\
-        matchzy_demo_upload_header_value \"Bearer tok_secret\"\n";
-
-    fn expected() -> DemoUploadExpectation {
-        parse_snippet(SNIPPET).unwrap()
-    }
-
-    #[test]
-    fn snippet_yields_url_and_header_key_only() {
-        assert_eq!(
-            expected(),
-            DemoUploadExpectation {
-                url: "https://portal.example/v1/demos".into(),
-                header_key: "Authorization".into(),
-            }
-        );
-        assert_eq!(parse_snippet(""), None);
-        assert_eq!(
-            parse_snippet("matchzy_demo_upload_url \"https://x\"\n"),
-            None
-        );
-        assert_eq!(
-            parse_snippet("matchzy_demo_upload_url \"\"\nmatchzy_demo_upload_header_key \"A\"\n"),
-            None
-        );
-    }
-
-    #[test]
-    fn cvar_replies_are_parsed_in_every_console_dialect() {
-        let name = "matchzy_demo_upload_url";
-        for (reply, want) in [
-            (
-                "matchzy_demo_upload_url = https://p/v1/demos",
-                "https://p/v1/demos",
-            ),
-            (
-                "matchzy_demo_upload_url = \"https://p/v1/demos\"",
-                "https://p/v1/demos",
-            ),
-            (
-                "\"matchzy_demo_upload_url\" = \"https://p/v1/demos\" ( def. \"\" )\n - help text",
-                "https://p/v1/demos",
-            ),
-            (
-                "matchzy_demo_upload_url = https://p/v1/demos ( def. \"\" )",
-                "https://p/v1/demos",
-            ),
-            (
-                "matchzy_demo_upload_url: https://p/v1/demos",
-                "https://p/v1/demos",
-            ),
-            (
-                "noise\n  MatchZy_Demo_Upload_URL is \"https://p/v1/demos\"\n",
-                "https://p/v1/demos",
-            ),
-            ("matchzy_demo_upload_url = \"\"", ""),
-            ("matchzy_demo_upload_url =", ""),
-        ] {
-            assert_eq!(
-                parse_cvar_reply(reply, name).as_deref(),
-                Some(want),
-                "{reply:?}"
-            );
-        }
-        for reply in [
-            "",
-            "Unknown command 'matchzy_demo_upload_url'!",
-            "matchzy_demo_upload_url_extra = x",
-            "matchzy_demo_upload_url",
-            "[MatchZy] matchzy_demo_upload_url updated",
-        ] {
-            assert_eq!(parse_cvar_reply(reply, name), None, "{reply:?}");
-        }
-    }
-
-    #[test]
-    fn wired_only_when_all_three_cvars_check_out() {
-        let e = expected();
-        let url = "matchzy_demo_upload_url = https://portal.example/v1/demos";
-        let key = "matchzy_demo_upload_header_key = Authorization";
-        let value = "matchzy_demo_upload_header_value = Bearer tok_secret";
-        assert_eq!(demo_upload_wired(&e, url, key, value), Some(true));
-        // What an unreconciled mods-update leaves behind: upstream's empties.
-        assert_eq!(
-            demo_upload_wired(&e, "matchzy_demo_upload_url = \"\"", key, value),
-            Some(false)
-        );
-        assert_eq!(
-            demo_upload_wired(
-                &e,
-                "matchzy_demo_upload_url = https://elsewhere/",
-                key,
-                value
-            ),
-            Some(false)
-        );
-        assert_eq!(
-            demo_upload_wired(&e, url, "matchzy_demo_upload_header_key = X-Other", value),
-            Some(false)
-        );
-        assert_eq!(
-            demo_upload_wired(&e, url, key, "matchzy_demo_upload_header_value = \"\""),
-            Some(false)
-        );
-        // Could not read one of them (plugin stack down): unknown, not "no".
-        assert_eq!(
-            demo_upload_wired(&e, "Unknown command 'matchzy_demo_upload_url'!", key, value),
-            None
-        );
-        assert_eq!(demo_upload_wired(&e, url, key, ""), None);
     }
 
     // --- state file → frames -------------------------------------------------
@@ -1707,27 +1551,169 @@ mod tests {
     // --- auto-repair ---------------------------------------------------------
 
     #[tokio::test]
-    async fn auto_repair_is_claimed_once_per_ten_minutes_and_only_when_definitely_unwired() {
+    async fn auto_repair_is_claimed_once_per_ten_minutes_and_only_when_definitely_broken() {
+        let health = |wired, applied| ConfigHealth {
+            demo_upload_wired: wired,
+            overrides_applied: applied,
+        };
+        let unwired = health(Some(false), None);
         let host = Host::new().capable();
         let updater = host.updater();
         let t0 = Instant::now();
-        assert!(!updater.claim_auto_repair(Some(true), t0));
+        assert!(!updater.claim_auto_repair(health(Some(true), Some(true)), t0));
         assert!(
-            !updater.claim_auto_repair(None, t0),
-            "unknown is not unwired"
+            !updater.claim_auto_repair(health(None, None), t0),
+            "unknown is not broken"
         );
-        assert!(updater.claim_auto_repair(Some(false), t0));
-        assert!(!updater.claim_auto_repair(Some(false), t0 + Duration::from_secs(30)));
-        assert!(!updater.claim_auto_repair(Some(false), t0 + Duration::from_secs(599)));
-        assert!(updater.claim_auto_repair(Some(false), t0 + Duration::from_secs(600)));
+        assert!(!updater.claim_auto_repair(health(Some(true), None), t0));
+        assert!(updater.claim_auto_repair(unwired, t0));
+        assert!(!updater.claim_auto_repair(unwired, t0 + Duration::from_secs(30)));
+        assert!(!updater.claim_auto_repair(unwired, t0 + Duration::from_secs(599)));
+        assert!(updater.claim_auto_repair(unwired, t0 + Duration::from_secs(600)));
+        // Overrides not applied is a reason too, under the same limit.
+        let stale_overrides = health(Some(true), Some(false));
+        assert!(!updater.claim_auto_repair(stale_overrides, t0 + Duration::from_secs(700)));
+        assert!(updater.claim_auto_repair(stale_overrides, t0 + Duration::from_secs(1200)));
 
         // Never on top of a running job, and that does not use up the slot.
         updater.start("mods", JOB, "portal").await.unwrap();
-        assert!(!updater.claim_auto_repair(Some(false), t0 + Duration::from_secs(2000)));
+        assert!(!updater.claim_auto_repair(unwired, t0 + Duration::from_secs(3000)));
         updater.settle_pending(None, Instant::now() + Duration::from_secs(61));
-        assert!(updater.claim_auto_repair(Some(false), t0 + Duration::from_secs(2000)));
+        assert!(updater.claim_auto_repair(unwired, t0 + Duration::from_secs(3000)));
 
         // Not on a host without the helper.
-        assert!(!Host::new().updater().claim_auto_repair(Some(false), t0));
+        assert!(!Host::new().updater().claim_auto_repair(unwired, t0));
+    }
+
+    // --- config health -------------------------------------------------------
+
+    fn write_config(host: &Host, report: &Value) {
+        std::fs::write(host.paths.run_dir.join("config.json"), report.to_string()).unwrap();
+    }
+
+    #[test]
+    fn config_health_comes_from_the_helpers_report() {
+        let host = Host::new();
+        let updater = host.updater();
+        assert_eq!(
+            updater.config_health(),
+            ConfigHealth::default(),
+            "no report yet"
+        );
+        assert!(!updater.config_health().needs_repair());
+
+        write_config(
+            &host,
+            &json!({
+                "checked_at": "2026-11-21T04:00:00Z", "demo_upload_wired": true,
+                "overrides_applied": null, "reason": null,
+            }),
+        );
+        let health = updater.config_health();
+        assert_eq!(health.demo_upload_wired, Some(true));
+        assert_eq!(health.overrides_applied, None);
+        assert!(!health.needs_repair());
+
+        write_config(
+            &host,
+            &json!({"demo_upload_wired": false, "overrides_applied": true, "reason": "x"}),
+        );
+        assert_eq!(updater.config_health().demo_upload_wired, Some(false));
+        assert!(updater.config_health().needs_repair());
+        write_config(
+            &host,
+            &json!({"demo_upload_wired": null, "overrides_applied": false}),
+        );
+        assert_eq!(updater.config_health().demo_upload_wired, None);
+        assert!(updater.config_health().needs_repair());
+
+        // Garbage, or the wrong types, is "unknown" — never "broken".
+        std::fs::write(host.paths.run_dir.join("config.json"), "{ not json").unwrap();
+        assert_eq!(updater.config_health(), ConfigHealth::default());
+        write_config(
+            &host,
+            &json!({"demo_upload_wired": "false", "overrides_applied": 0}),
+        );
+        assert_eq!(updater.config_health(), ConfigHealth::default());
+    }
+
+    #[test]
+    fn a_stale_config_report_is_unknown() {
+        let host = Host::new();
+        let updater = host.updater();
+        write_config(
+            &host,
+            &json!({"demo_upload_wired": false, "overrides_applied": false}),
+        );
+        let path = host.paths.run_dir.join("config.json");
+        let set_age = |secs: u64| {
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(std::time::SystemTime::now() - Duration::from_secs(secs))
+                .unwrap();
+        };
+        set_age(14 * 60);
+        assert_eq!(updater.config_health().demo_upload_wired, Some(false));
+        // Older than 15 minutes: the helper has not been heard from; do not
+        // report — or repair on the strength of — what it said back then.
+        set_age(16 * 60);
+        assert_eq!(updater.config_health(), ConfigHealth::default());
+        assert!(!updater.config_health().needs_repair());
+    }
+
+    #[tokio::test]
+    async fn verify_config_runs_on_connect_and_every_five_minutes_when_idle() {
+        let host = Host::new().capable();
+        let updater = host.updater();
+        let t0 = Instant::now();
+        assert!(updater.verify_config(false, t0).await, "first time");
+        assert!(
+            !updater
+                .verify_config(false, t0 + Duration::from_secs(299))
+                .await
+        );
+        assert!(
+            updater
+                .verify_config(true, t0 + Duration::from_secs(10))
+                .await,
+            "connect forces"
+        );
+        assert!(
+            !updater
+                .verify_config(false, t0 + Duration::from_secs(300))
+                .await,
+            "counted from the last run"
+        );
+        assert!(
+            updater
+                .verify_config(false, t0 + Duration::from_secs(310))
+                .await
+        );
+        // It is not a job: nothing is claimed, no request is written.
+        assert_eq!(updater.running_job(), None);
+        assert!(!host.paths.run_dir.join("request.json").exists());
+        assert_eq!(
+            systemctl_args("verify-config").last().unwrap(),
+            "portal-gs-update@verify-config.service"
+        );
+
+        // Never while a job runs, not even on connect; and the turn is kept.
+        updater.start("mods", JOB, "portal").await.unwrap();
+        assert!(
+            !updater
+                .verify_config(true, t0 + Duration::from_secs(1000))
+                .await
+        );
+        updater.settle_pending(None, Instant::now() + Duration::from_secs(61));
+        assert!(
+            updater
+                .verify_config(false, t0 + Duration::from_secs(1000))
+                .await
+        );
+
+        // Not on a host without the helper; a failing systemctl is not fatal.
+        assert!(!Host::new().updater().verify_config(true, t0).await);
+        let mut broken = Host::new().capable();
+        broken.paths.systemctl = "false".into();
+        assert!(!broken.updater().verify_config(true, t0).await);
     }
 }

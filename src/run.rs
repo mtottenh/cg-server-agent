@@ -23,8 +23,6 @@ use crate::update::{self, Event, SentThisConnection, Updater};
 /// changed the file under it (`needs_reload`). Agent-internal: it never goes
 /// through `exec_refusal`, which keeps refusing `exec` from the portal.
 const RELOAD_MATCHZY_CONFIG: &str = "exec MatchZy/config.cfg";
-/// How often a pending reload is retried (RCON down, match in progress).
-const RELOAD_RETRY: Duration = Duration::from_secs(10);
 
 pub struct RunConfig {
     pub portal_url: String,
@@ -82,15 +80,19 @@ pub async fn run(config: RunConfig) -> Result<()> {
 /// After a `repair-config` the file is right but the running server has not
 /// read it. Re-executing the MatchZy config resets settings a live match
 /// depends on, so it waits until MatchZy reports no match loaded; and it is
-/// retried for as long as RCON is unreachable. Independent of the portal
+/// retried for as long as RCON is unreachable (every 10 s; every 5 min once
+/// MatchZy itself has been silent for a few minutes — see `reload_step`). Independent of the portal
 /// connection: a repair the agent started on its own while offline still
 /// takes effect.
 async fn reload_when_idle(updater: Arc<Updater>, rcon_addr: String, rcon_password: String) {
-    let mut tick = tokio::time::interval(RELOAD_RETRY);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Since when MatchZy has not been answering `get5_status` although RCON
+    // works (the plugin stack is not loaded).
+    let mut unanswered_since: Option<Instant> = None;
     loop {
-        tick.tick().await;
+        let unanswered_for = unanswered_since.map(|at| at.elapsed());
+        tokio::time::sleep(update::reload_retry_delay(unanswered_for)).await;
         if !updater.reload_pending() {
+            unanswered_since = None;
             continue;
         }
         let status = match rcon::exec(&rcon_addr, &rcon_password, "get5_status").await {
@@ -100,18 +102,35 @@ async fn reload_when_idle(updater: Arc<Updater>, rcon_addr: String, rcon_passwor
                 continue;
             }
         };
-        if !update::reload_allowed(status.as_ref()) {
-            tracing::debug!(
-                "MatchZy config reload deferred: a match is loaded (or MatchZy did not answer)"
-            );
-            continue;
+        let step = update::reload_step(status.as_ref(), unanswered_for);
+        if status.is_some() {
+            unanswered_since = None;
+        } else if unanswered_since.is_none() {
+            unanswered_since = Some(Instant::now());
         }
-        match rcon::exec(&rcon_addr, &rcon_password, RELOAD_MATCHZY_CONFIG).await {
-            Ok(_) => {
-                updater.reload_done();
-                tracing::info!("reloaded the MatchZy config over RCON");
+        match step {
+            update::ReloadStep::Wait => {
+                tracing::debug!(
+                    "MatchZy config reload deferred: a match is loaded, or MatchZy is not answering"
+                );
             }
-            Err(e) => tracing::warn!(error = %e, "could not reload the MatchZy config; will retry"),
+            update::ReloadStep::Done => {
+                updater.reload_done();
+                tracing::info!(
+                    "MatchZy was loaded afresh and has read its config; no reload needed"
+                );
+            }
+            update::ReloadStep::Exec => {
+                match rcon::exec(&rcon_addr, &rcon_password, RELOAD_MATCHZY_CONFIG).await {
+                    Ok(_) => {
+                        updater.reload_done();
+                        tracing::info!("reloaded the MatchZy config over RCON");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not reload the MatchZy config; will retry");
+                    }
+                }
+            }
         }
     }
 }

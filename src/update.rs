@@ -56,6 +56,12 @@ const VERIFY_INTERVAL: Duration = Duration::from_secs(300);
 /// A `config.json` older than this says nothing about the config now.
 const CONFIG_MAX_AGE: Duration = Duration::from_secs(900);
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(15);
+/// A pending reload is retried this often…
+const RELOAD_RETRY: Duration = Duration::from_secs(10);
+/// …unless MatchZy has not answered `get5_status` for this long (the plugin
+/// stack is not loaded): then only this often.
+const RELOAD_UNLOADED_AFTER: Duration = Duration::from_secs(180);
+const RELOAD_UNLOADED_RETRY: Duration = Duration::from_secs(300);
 /// Job ids the portal has acknowledged, newest last.
 const ACKED_KEPT: usize = 8;
 
@@ -78,7 +84,8 @@ pub struct Paths {
     /// Portal-managed MatchZy overrides, written here, read by the helper.
     pub overrides: PathBuf,
     pub systemctl: PathBuf,
-    /// The agent's own: `acked-jobs`, `unacked-result.json`.
+    /// The agent's own: `acked-jobs`, `unacked-result.json`, `pending-job.json`,
+    /// `reload-pending`, `auto-repair.json`.
     pub agent_state_dir: PathBuf,
     pub proc_dir: PathBuf,
 }
@@ -104,6 +111,31 @@ struct Pending {
     job_id: String,
     operation: String,
     since: Instant,
+    /// Consecutive definite "not active" answers from systemd.
+    inactive_seen: u32,
+}
+
+/// What `systemctl is-active` said about a unit instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitState {
+    /// active, activating, deactivating or reloading.
+    Active,
+    /// A definite `inactive` or `failed`.
+    Inactive,
+    /// No usable answer: systemctl failed, timed out, or was not asked.
+    Unknown,
+}
+
+/// What to do about a pending MatchZy config reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadStep {
+    /// No match is loaded: run `exec MatchZy/config.cfg` now.
+    Exec,
+    /// Not now (a match is loaded, or MatchZy did not answer): ask again.
+    Wait,
+    /// Nothing left to do: MatchZy has just been loaded afresh and read the
+    /// file itself.
+    Done,
 }
 
 /// What the helper last found in the MatchZy config file
@@ -266,6 +298,54 @@ pub fn reload_allowed(get5_status: Option<&Value>) -> bool {
         .and_then(|s| s.get("gamestate"))
         .and_then(Value::as_str)
         == Some("none")
+}
+
+/// Decide a pending reload from MatchZy's answer to `get5_status` (`None`:
+/// RCON worked but MatchZy did not answer — the plugin stack is not loaded)
+/// and for how long it had not been answering before this.
+pub fn reload_step(get5_status: Option<&Value>, unanswered_for: Option<Duration>) -> ReloadStep {
+    match get5_status {
+        None => ReloadStep::Wait,
+        // It was gone for minutes and is back: a plugin stack that has just
+        // been loaded executed MatchZy/config.cfg on its way up. Doing it
+        // again — possibly into a match that is already being set up — would
+        // only be a risk.
+        Some(_) if unanswered_for.is_some_and(|d| d >= RELOAD_UNLOADED_AFTER) => ReloadStep::Done,
+        status if reload_allowed(status) => ReloadStep::Exec,
+        Some(_) => ReloadStep::Wait,
+    }
+}
+
+/// How long to wait before the next attempt at a pending reload. Every 10
+/// seconds while there is a server to talk to; every 5 minutes once MatchZy
+/// has been silent for 3 — there is no point asking a server without its
+/// plugin stack six times a minute for as long as it stays that way.
+pub fn reload_retry_delay(unanswered_for: Option<Duration>) -> Duration {
+    if unanswered_for.is_some_and(|d| d >= RELOAD_UNLOADED_AFTER) {
+        RELOAD_UNLOADED_RETRY
+    } else {
+        RELOAD_RETRY
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The `Instant` that corresponds to a wall-clock time recorded by an
+/// earlier agent process (`now` if that is not representable).
+fn instant_at(unix_secs: u64) -> Instant {
+    let now = Instant::now();
+    now.checked_sub(Duration::from_secs(unix_now().saturating_sub(unix_secs)))
+        .unwrap_or(now)
+}
+
+/// The wall-clock time of an `Instant` in the recent past.
+fn unix_at(at: Instant) -> u64 {
+    unix_now().saturating_sub(Instant::now().saturating_duration_since(at).as_secs())
 }
 
 // --- MatchZy overrides -------------------------------------------------------
@@ -464,7 +544,13 @@ impl Tracker {
             // Declared dead, yet it finished: the truth supersedes our guess.
             if is_terminal(status) && self.synthesized.as_deref() == Some(job_id) {
                 self.synthesized = None;
-                return vec![Event::Result(state.clone())];
+                // …in the form it would have had: a check that succeeded
+                // reports through `update_state`, never as a result.
+                return if is_check && status == "succeeded" {
+                    vec![Event::CheckDone]
+                } else {
+                    vec![Event::Result(state.clone())]
+                };
             }
             return Vec::new();
         }
@@ -547,14 +633,38 @@ impl Updater {
             })
             .unwrap_or_default();
         let extra = read_json(&paths.agent_state_dir.join("unacked-result.json"));
+        // What an earlier agent process (before a restart, a deb upgrade)
+        // still owed: a job it had started, a reload, its repair backoff.
+        let pending = read_json(&paths.agent_state_dir.join("pending-job.json")).and_then(|p| {
+            let job_id = str_field(&p, "job_id");
+            let operation = str_field(&p, "operation");
+            (valid_job_id(job_id) && (operation == "check" || OPERATIONS.contains(&operation)))
+                .then(|| Pending {
+                    job_id: job_id.to_string(),
+                    operation: operation.to_string(),
+                    since: instant_at(p.get("started_at").and_then(Value::as_u64).unwrap_or(0)),
+                    inactive_seen: 0,
+                })
+        });
+        let repair = read_json(&paths.agent_state_dir.join("auto-repair.json"))
+            .map(|r| RepairState {
+                last: r.get("last_at").and_then(Value::as_u64).map(instant_at),
+                streak: r
+                    .get("streak")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0),
+            })
+            .unwrap_or_default();
+        let reload_pending = paths.agent_state_dir.join("reload-pending").exists();
         Self {
             paths,
-            pending: Mutex::new(None),
-            repair: Mutex::new(RepairState::default()),
+            pending: Mutex::new(pending),
+            repair: Mutex::new(repair),
             last_verify: Mutex::new(None),
             acked: Mutex::new(acked),
             extra: Mutex::new(extra),
-            reload_pending: AtomicBool::new(false),
+            reload_pending: AtomicBool::new(reload_pending),
             unit_probe: Mutex::new(None),
         }
     }
@@ -578,21 +688,23 @@ impl Updater {
 
     // --- is the helper alive -------------------------------------------------
 
-    /// Ask systemd whether an operation's unit instance is (still) running.
-    /// Needs no privilege. `false` on any error: the caller's fallback is
-    /// `/proc`.
-    pub async fn unit_active(&self, operation: &str) -> bool {
+    /// Ask systemd about an operation's unit instance. Needs no privilege.
+    /// Only a definite answer counts either way: a systemctl that fails or
+    /// times out (D-Bus hiccup, systemd reloading) says nothing about the
+    /// unit.
+    pub async fn unit_state(&self, operation: &str) -> UnitState {
         let mut command = tokio::process::Command::new(&self.paths.systemctl);
         command
             .args(["is-active", &unit_name(operation)])
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
         match tokio::time::timeout(SYSTEMCTL_TIMEOUT, command.output()).await {
-            Ok(Ok(output)) => matches!(
-                String::from_utf8_lossy(&output.stdout).trim(),
-                "active" | "activating" | "deactivating" | "reloading"
-            ),
-            _ => false,
+            Ok(Ok(output)) => match String::from_utf8_lossy(&output.stdout).trim() {
+                "active" | "activating" | "deactivating" | "reloading" => UnitState::Active,
+                "inactive" | "failed" => UnitState::Inactive,
+                _ => UnitState::Unknown,
+            },
+            _ => UnitState::Unknown,
         }
     }
 
@@ -612,7 +724,7 @@ impl Updater {
                 return;
             }
         }
-        let active = self.unit_active(str_field(state, "operation")).await;
+        let active = self.unit_state(str_field(state, "operation")).await == UnitState::Active;
         *self.unit_probe.lock().unwrap() = Some((job.to_string(), active, Instant::now()));
     }
 
@@ -671,6 +783,25 @@ impl Updater {
 
     // --- starting jobs -------------------------------------------------------
 
+    /// Set or clear the claim on a started unit, on disk too: an agent that
+    /// is restarted seconds after starting a job (a deb upgrade does that)
+    /// must still tell the portal how that job ended.
+    fn store_pending(&self, slot: &mut Option<Pending>, value: Option<Pending>) {
+        match &value {
+            Some(p) => self.persist(
+                "pending-job.json",
+                &json!({
+                    "job_id": p.job_id, "operation": p.operation, "started_at": unix_at(p.since),
+                })
+                .to_string(),
+            ),
+            None => {
+                let _ = std::fs::remove_file(self.paths.agent_state_dir.join("pending-job.json"));
+            }
+        }
+        *slot = value;
+    }
+
     /// Start one helper operation. Returns as soon as systemd has accepted
     /// the start; the job itself is followed by the watcher.
     pub async fn start(&self, operation: &str, job_id: &str, trigger: &str) -> Result<()> {
@@ -697,23 +828,31 @@ impl Updater {
             }
             write_atomic(
                 &request,
-                &json!({ "job_id": job_id, "operation": operation, "trigger": trigger })
-                    .to_string(),
+                // `created_at`: the helper only honours a request from the
+                // last minute, so one orphaned by a failed start is never
+                // picked up by a later run.
+                &json!({
+                    "job_id": job_id, "operation": operation, "trigger": trigger,
+                    "created_at": unix_now(),
+                })
+                .to_string(),
                 0o644,
             )
             .context("writing the update request")?;
-            *pending = Some(Pending {
+            let claim = Pending {
                 job_id: job_id.to_string(),
                 operation: operation.to_string(),
                 since: Instant::now(),
-            });
+                inactive_seen: 0,
+            };
+            self.store_pending(&mut pending, Some(claim));
         }
 
         let started = self.systemctl_start(operation).await;
         if let Err(e) = started {
             let mut pending = self.pending.lock().unwrap();
             if pending.as_ref().is_some_and(|p| p.job_id == job_id) {
-                *pending = None;
+                self.store_pending(&mut pending, None);
             }
             let _ = std::fs::remove_file(&request);
             return Err(e);
@@ -758,37 +897,44 @@ impl Updater {
             .map(|p| p.operation.clone())
     }
 
-    /// Resolve a unit we started. `unit_active` is systemd's answer for it
-    /// (`true` when not asked). Returns a result to report, if there is one:
+    /// Resolve a unit we started. `unit` is systemd's answer for it
+    /// (`Unknown` when not asked, or when systemctl gave no usable answer).
+    /// Returns a result to report, if there is one:
     ///
     /// * the helper published state for the job → nothing, the watcher has it;
     /// * the helper finished but could not publish (run directory full): its
     ///   own record from `last-job.json`;
-    /// * the grace period is over and the unit is gone without a trace (it
+    /// * the grace period is over and systemd has said twice in a row,
+    ///   definitely, that the unit is not active, and it left no trace (it
     ///   never got the lock, the request was refused, the unit failed): a
     ///   synthesized failure;
-    /// * otherwise — still within the grace period, or the unit is still
-    ///   active, e.g. waiting for the lock — keep waiting.
+    /// * otherwise — still within the grace period, the unit still active
+    ///   (e.g. waiting for the lock), or no clear answer — keep waiting.
     pub fn settle_pending(
         &self,
         state: Option<&Value>,
         now: Instant,
-        unit_active: bool,
+        unit: UnitState,
     ) -> Option<Value> {
         let mut pending = self.pending.lock().unwrap();
-        let p = pending.as_ref()?;
+        let p = pending.as_mut()?;
         if state.is_some_and(|s| str_field(s, "job_id") == p.job_id) {
-            *pending = None;
+            self.store_pending(&mut pending, None);
             return None;
         }
         if let Some(last) = read_json(&self.paths.state_dir.join("last-job.json"))
             && str_field(&last, "job_id") == p.job_id
             && is_terminal(str_field(&last, "status"))
         {
-            *pending = None;
+            self.store_pending(&mut pending, None);
             return Some(last);
         }
-        if now.duration_since(p.since) < PENDING_GRACE || unit_active {
+        match unit {
+            UnitState::Active => p.inactive_seen = 0,
+            UnitState::Inactive => p.inactive_seen += 1,
+            UnitState::Unknown => {}
+        }
+        if now.duration_since(p.since) < PENDING_GRACE || p.inactive_seen < 2 {
             return None;
         }
         let failure = json!({
@@ -803,7 +949,7 @@ impl Updater {
                 unit_name(&p.operation)
             ),
         });
-        *pending = None;
+        self.store_pending(&mut pending, None);
         // Ours, and nobody is coming for it.
         let _ = std::fs::remove_file(self.paths.run_dir.join("request.json"));
         Some(failure)
@@ -978,8 +1124,9 @@ impl Updater {
     /// it. Claims the slot when it says yes.
     pub fn claim_auto_repair(&self, health: ConfigHealth, now: Instant) -> bool {
         let mut repair = self.repair.lock().unwrap();
-        if health.healthy() {
+        if health.healthy() && repair.streak != 0 {
             repair.streak = 0;
+            self.persist_repair(&repair);
         }
         if !health.needs_repair()
             || !health.auto_repair
@@ -999,15 +1146,28 @@ impl Updater {
         }
         repair.last = Some(now);
         repair.streak = repair.streak.saturating_add(1);
+        self.persist_repair(&repair);
         true
+    }
+
+    /// The backoff survives an agent restart: a repair that cannot work must
+    /// not get a fresh start every time the agent does.
+    fn persist_repair(&self, repair: &RepairState) {
+        self.persist(
+            "auto-repair.json",
+            &json!({ "streak": repair.streak, "last_at": repair.last.map(unix_at) }).to_string(),
+        );
     }
 
     /// The running server has to re-read the MatchZy config (a
     /// `repair-config` changed the file under it). Stays set until
-    /// `reload_done`: across RCON outages, and for as long as a match is
-    /// loaded.
+    /// `reload_done`: across RCON outages, for as long as a match is loaded,
+    /// and across agent restarts (it is on disk) — otherwise an upgrade of
+    /// the agent right after a repair would leave the server on its old
+    /// settings with the heartbeat saying all is well.
     pub fn request_reload(&self) {
         self.reload_pending.store(true, Ordering::SeqCst);
+        self.persist("reload-pending", "");
     }
 
     pub fn reload_pending(&self) -> bool {
@@ -1016,6 +1176,7 @@ impl Updater {
 
     pub fn reload_done(&self) {
         self.reload_pending.store(false, Ordering::SeqCst);
+        let _ = std::fs::remove_file(self.paths.agent_state_dir.join("reload-pending"));
     }
 
     /// Everything that follows from a result leaving the watcher, before it
@@ -1055,14 +1216,14 @@ pub fn spawn_watcher(updater: Arc<Updater>) -> mpsc::Receiver<Event> {
             let mut events = Vec::new();
 
             // A unit we started that shows no state: ask systemd, not a timer.
-            let mut unit_active = true;
+            let mut unit = UnitState::Unknown;
             if let Some(operation) = updater.pending_overdue(now)
                 && last_pending_probe.is_none_or(|at| now.duration_since(at) >= UNIT_PROBE_INTERVAL)
             {
                 last_pending_probe = Some(now);
-                unit_active = updater.unit_active(&operation).await;
+                unit = updater.unit_state(&operation).await;
             }
-            if let Some(result) = updater.settle_pending(state.as_ref(), now, unit_active) {
+            if let Some(result) = updater.settle_pending(state.as_ref(), now, unit) {
                 events.push(Event::Result(result));
             }
 
@@ -1086,6 +1247,10 @@ pub fn spawn_watcher(updater: Arc<Updater>) -> mpsc::Receiver<Event> {
                         }
                     }
                     Event::CheckDone => {
+                        // A failure made up for this check is not owed any more.
+                        if let Some(state) = &state {
+                            updater.drop_extra_for(str_field(state, "job_id"));
+                        }
                         if tx.send(event).await.is_err() {
                             return;
                         }
@@ -1116,6 +1281,8 @@ echo "$*" >>"$d/calls"
 case "$1" in
     is-active)
         s=$(cat "$d/unit-state" 2>/dev/null || echo inactive)
+        # "error": what a D-Bus hiccup looks like — no answer, just a failure.
+        [ "$s" != error ] || { echo "Failed to connect to bus" >&2; exit 1; }
         echo "$s"
         [ "$s" = active ]
         ;;
@@ -1175,6 +1342,10 @@ esac
 
         fn updater(&self) -> Updater {
             Updater::new(self.paths.clone())
+        }
+
+        fn agent_file(&self, name: &str) -> PathBuf {
+            self.paths.agent_state_dir.join(name)
         }
 
         fn write_state(&self, state: &Value) {
@@ -1238,6 +1409,14 @@ esac
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    impl Updater {
+        /// The unit is definitely gone: two consecutive `inactive` answers.
+        fn settle_pending_gone(&self, now: Instant) -> Option<Value> {
+            let first = self.settle_pending(None, now, UnitState::Inactive);
+            first.or_else(|| self.settle_pending(None, now, UnitState::Inactive))
+        }
     }
 
     // --- overrides -----------------------------------------------------------
@@ -1629,6 +1808,37 @@ esac
         assert!(t.observe(Some(&stale), false, t0 + secs(600)).is_empty());
     }
 
+    #[test]
+    fn a_check_that_finishes_after_being_declared_dead_reports_as_a_check() {
+        let mut t = Tracker::default();
+        let t0 = Instant::now();
+        let running = state(JOB, "check", "running", "check", "");
+        t.observe(Some(&running), false, t0);
+        let e = t.observe(Some(&running), false, t0 + secs(6));
+        assert!(
+            matches!(e.as_slice(), [Event::Result(r)] if r["agent_synthesized"] == true),
+            "{e:?}"
+        );
+        // It was alive after all and succeeded: that is an `update_state`,
+        // exactly as if it had never been doubted — not an `update_result`.
+        let done = state(JOB, "check", "succeeded", "done", "");
+        assert_eq!(
+            t.observe(Some(&done), false, t0 + secs(20)),
+            vec![Event::CheckDone]
+        );
+        assert!(t.observe(Some(&done), false, t0 + secs(21)).is_empty());
+        // A check that really failed is still a result.
+        let mut t = Tracker::default();
+        let running = state(JOB2, "check", "running", "check", "");
+        t.observe(Some(&running), false, t0);
+        t.observe(Some(&running), false, t0 + secs(6));
+        let failed = state(JOB2, "check", "failed", "check", "");
+        assert_eq!(
+            t.observe(Some(&failed), false, t0 + secs(20)),
+            vec![Event::Result(failed.clone())]
+        );
+    }
+
     // --- liveness ------------------------------------------------------------
 
     #[tokio::test]
@@ -1675,14 +1885,25 @@ esac
         host.helper_process(4242);
         assert!(updater.helper_alive(&running));
 
-        for (answer, alive) in [
-            ("activating", true),
-            ("deactivating", true),
-            ("failed", false),
+        for (answer, state) in [
+            ("active", UnitState::Active),
+            ("activating", UnitState::Active),
+            ("deactivating", UnitState::Active),
+            ("inactive", UnitState::Inactive),
+            ("failed", UnitState::Inactive),
+            // Neither yes nor no: it must not be read as "the unit is gone".
+            ("error", UnitState::Unknown),
+            ("maintenance", UnitState::Unknown),
         ] {
             host.unit_state(answer);
-            assert_eq!(host.updater().unit_active("mods").await, alive, "{answer}");
+            assert_eq!(host.updater().unit_state("mods").await, state, "{answer}");
         }
+        let mut broken = Host::new().capable();
+        broken.paths.systemctl = broken.root.join("no-such-systemctl");
+        assert_eq!(
+            broken.updater().unit_state("mods").await,
+            UnitState::Unknown
+        );
     }
 
     // --- delivery: ack and replay --------------------------------------------
@@ -1890,7 +2111,14 @@ esac
         assert_eq!(updater.running_job(), None);
         updater.start("mods", JOB, "portal").await.unwrap();
 
-        let request: Value = read_json(&host.paths.run_dir.join("request.json")).unwrap();
+        let mut request: Value = read_json(&host.paths.run_dir.join("request.json")).unwrap();
+        assert!(
+            request
+                .as_object_mut()
+                .unwrap()
+                .remove("created_at")
+                .is_some()
+        );
         assert_eq!(
             request,
             json!({"job_id": JOB, "operation": "mods", "trigger": "portal"})
@@ -2039,10 +2267,11 @@ esac
         let updater = host.updater();
         updater.start("mods", JOB, "portal").await.unwrap();
         let now = Instant::now();
+        let settle = |at: u64, unit| updater.settle_pending(None, now + secs(at), unit);
 
         // Within the grace period nothing is decided, and systemd not asked.
         assert_eq!(updater.pending_overdue(now + secs(5)), None);
-        assert_eq!(updater.settle_pending(None, now + secs(5), false), None);
+        assert_eq!(settle(5, UnitState::Unknown), None);
         // After it: ask about exactly that unit…
         assert_eq!(
             updater.pending_overdue(now + secs(11)).as_deref(),
@@ -2051,21 +2280,25 @@ esac
         // …and as long as it is active (waiting for the lock behind the
         // nightly cron, or running but unable to publish), keep waiting —
         // for hours if need be.
-        assert_eq!(updater.settle_pending(None, now + secs(11), true), None);
-        assert_eq!(updater.settle_pending(None, now + secs(61), true), None);
-        assert_eq!(updater.settle_pending(None, now + secs(7200), true), None);
+        for at in [11, 61, 7200] {
+            assert_eq!(settle(at, UnitState::Active), None);
+        }
         assert!(updater.running_job().is_some());
         // Someone else's state does not settle it.
         let other = state(JOB2, "game", "succeeded", "done", "");
         assert_eq!(
-            updater.settle_pending(Some(&other), now + secs(61), true),
+            updater.settle_pending(Some(&other), now + secs(61), UnitState::Active),
             None
         );
 
-        // The unit is gone and left nothing: that is a failure.
-        let failure = updater
-            .settle_pending(Some(&other), now + secs(7201), false)
-            .unwrap();
+        // The unit is gone and left nothing: that is a failure — once
+        // systemd has said so twice.
+        assert_eq!(
+            settle(7201, UnitState::Inactive),
+            None,
+            "once is not enough"
+        );
+        let failure = settle(7203, UnitState::Inactive).unwrap();
         assert_eq!(failure["job_id"], JOB);
         assert_eq!(failure["operation"], "mods");
         assert_eq!(failure["status"], "failed");
@@ -2078,20 +2311,40 @@ esac
         );
         assert_eq!(updater.running_job(), None);
         assert!(!host.paths.run_dir.join("request.json").exists());
-        assert_eq!(
-            updater.settle_pending(None, now + secs(9000), false),
-            None,
-            "reported once"
-        );
+        assert_eq!(settle(9000, UnitState::Inactive), None, "reported once");
+        assert_eq!(settle(9002, UnitState::Inactive), None, "reported once");
 
         // The normal path: the helper picks it up, the claim just goes away.
         updater.start("mods", JOB2, "portal").await.unwrap();
         let picked_up = state(JOB2, "mods", "running", "init", "");
         assert_eq!(
-            updater.settle_pending(Some(&picked_up), now + secs(300), false),
+            updater.settle_pending(Some(&picked_up), now + secs(300), UnitState::Inactive),
             None
         );
         assert_eq!(updater.pending_overdue(now + secs(9999)), None);
+    }
+
+    #[tokio::test]
+    async fn a_systemctl_error_is_not_proof_that_the_unit_is_gone() {
+        let host = Host::new().capable();
+        let updater = host.updater();
+        updater.start("mods", JOB, "portal").await.unwrap();
+        let now = Instant::now();
+        let settle = |at: u64, unit| updater.settle_pending(None, now + secs(at), unit);
+
+        // systemctl failing (D-Bus hiccup, daemon-reload) says nothing,
+        // however often it happens.
+        for at in [11, 13, 15, 600] {
+            assert_eq!(settle(at, UnitState::Unknown), None, "{at}s");
+        }
+        // One "inactive" between "active" answers (a unit restart) is not
+        // two in a row; an error in between does not make it so either.
+        assert_eq!(settle(602, UnitState::Inactive), None);
+        assert_eq!(settle(604, UnitState::Active), None);
+        assert_eq!(settle(606, UnitState::Inactive), None);
+        assert_eq!(settle(608, UnitState::Unknown), None);
+        assert!(updater.running_job().is_some());
+        assert!(settle(610, UnitState::Inactive).is_some());
     }
 
     #[tokio::test]
@@ -2104,7 +2357,7 @@ esac
         updater.start("repair-config", JOB, "portal").await.unwrap();
         let recorded = state(JOB, "repair-config", "succeeded", "done", "");
         host.write_last_job(&recorded);
-        let got = updater.settle_pending(None, Instant::now() + secs(1), true);
+        let got = updater.settle_pending(None, Instant::now() + secs(1), UnitState::Active);
         assert_eq!(got, Some(recorded.clone()));
         assert!(!is_synthesized(&recorded));
         assert_eq!(updater.running_job(), None);
@@ -2114,8 +2367,130 @@ esac
             .await
             .unwrap();
         assert_eq!(
-            updater.settle_pending(None, Instant::now() + secs(1), true),
+            updater.settle_pending(None, Instant::now() + secs(1), UnitState::Active),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_request_is_stamped_so_a_stale_one_is_never_adopted() {
+        let host = Host::new().capable();
+        let before = unix_now();
+        host.updater().start("mods", JOB, "portal").await.unwrap();
+        let request: Value = read_json(&host.paths.run_dir.join("request.json")).unwrap();
+        let created = request["created_at"].as_u64().unwrap();
+        assert!((before..=unix_now()).contains(&created), "{created}");
+    }
+
+    // --- surviving an agent restart ------------------------------------------
+
+    #[tokio::test]
+    async fn a_job_started_just_before_an_agent_restart_still_gets_a_result() {
+        let host = Host::new().capable();
+        host.updater().start("mods", JOB, "portal").await.unwrap();
+        assert!(host.agent_file("pending-job.json").exists());
+
+        // The agent is restarted (deb upgrade) before the helper wrote
+        // anything. The new process knows about the job…
+        let restarted = host.updater();
+        assert_eq!(
+            restarted.running_job(),
+            Some(
+                json!({"job_id": JOB, "operation": "mods", "phase": "starting", "status": "running"})
+            )
+        );
+        let err = restarted
+            .start("game", JOB2, "portal")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already running"), "{err}");
+        // …keeps its age (the grace period is not started over)…
+        let now = Instant::now();
+        assert_eq!(
+            restarted.pending_overdue(now + secs(11)).as_deref(),
+            Some("mods")
+        );
+        // …and reports how it ended: here, the unit died without a trace.
+        let failure = restarted.settle_pending_gone(now + secs(11)).unwrap();
+        assert_eq!(failure["job_id"], JOB);
+        assert!(!host.agent_file("pending-job.json").exists());
+        assert_eq!(host.updater().running_job(), None, "settled for good");
+
+        // Or the helper picked it up meanwhile: the claim just goes away.
+        host.updater().start("mods", JOB2, "portal").await.unwrap();
+        let restarted = host.updater();
+        let picked_up = state(JOB2, "mods", "running", "stop", "");
+        assert_eq!(
+            restarted.settle_pending(Some(&picked_up), now, UnitState::Unknown),
+            None
+        );
+        assert!(!host.agent_file("pending-job.json").exists());
+
+        // A start that systemd refused leaves nothing behind either.
+        let host = Host::new().capable();
+        host.start_fails();
+        assert!(host.updater().start("mods", JOB, "portal").await.is_err());
+        assert!(!host.agent_file("pending-job.json").exists());
+        // Garbage in the file is not a job.
+        std::fs::write(
+            host.agent_file("pending-job.json"),
+            r#"{"job_id": "x; reboot", "operation": "mods", "started_at": 1}"#,
+        )
+        .unwrap();
+        assert_eq!(host.updater().running_job(), None);
+        std::fs::write(
+            host.agent_file("pending-job.json"),
+            json!({"job_id": JOB, "operation": "rm -rf", "started_at": 1}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(host.updater().running_job(), None);
+    }
+
+    #[test]
+    fn a_pending_reload_survives_an_agent_restart() {
+        let host = Host::new();
+        let updater = host.updater();
+        let mut repaired = state(JOB, "repair-config", "succeeded", "done", "");
+        repaired["needs_reload"] = json!(true);
+        updater.note_result(&repaired);
+        assert!(updater.reload_pending());
+        // Restarted before the server was idle enough to reload.
+        let restarted = host.updater();
+        assert!(restarted.reload_pending(), "lost with the process");
+        restarted.reload_done();
+        assert!(!restarted.reload_pending());
+        assert!(!host.updater().reload_pending(), "done is done");
+    }
+
+    #[test]
+    fn the_auto_repair_backoff_survives_an_agent_restart() {
+        let broken = health(Some(true), Some(false));
+        let host = Host::new().capable();
+        let t0 = Instant::now();
+        // Three repairs that did not help: the next is due 40 minutes later.
+        let updater = host.updater();
+        assert!(updater.claim_auto_repair(broken, t0));
+        assert!(updater.claim_auto_repair(broken, t0 + secs(600)));
+        assert!(updater.claim_auto_repair(broken, t0 + secs(1800)));
+        assert!(!updater.claim_auto_repair(broken, t0 + secs(1800 + 2399)));
+
+        // A restart must not hand it a fresh start. (The persisted time is
+        // "now" for this test, the streak is what was reached.)
+        let restarted = host.updater();
+        let t1 = Instant::now();
+        assert!(!restarted.claim_auto_repair(broken, t1));
+        assert!(!restarted.claim_auto_repair(broken, t1 + secs(600)));
+        assert!(!restarted.claim_auto_repair(broken, t1 + secs(2390)));
+        assert!(restarted.claim_auto_repair(broken, t1 + secs(2405)));
+        // A healthy reading resets it, on disk too.
+        assert!(!restarted.claim_auto_repair(health(Some(true), Some(true)), t1 + secs(2500)));
+        let again = host.updater();
+        let t2 = Instant::now();
+        assert!(again.claim_auto_repair(broken, t2 + secs(600)));
+        assert!(
+            again.claim_auto_repair(broken, t2 + secs(1200)),
+            "back to 10 minutes"
         );
     }
 
@@ -2163,7 +2538,7 @@ esac
         let updater = host.updater();
         updater.start("mods", JOB, "portal").await.unwrap();
         assert!(!updater.claim_auto_repair(unwired, t0));
-        updater.settle_pending(None, Instant::now() + secs(61), false);
+        updater.settle_pending_gone(Instant::now() + secs(61));
         assert!(updater.claim_auto_repair(unwired, t0));
 
         // Not on a host without the helper.
@@ -2217,6 +2592,33 @@ esac
         assert!(!reload_allowed(None));
         assert!(!reload_allowed(Some(&json!({}))));
         assert!(!reload_allowed(Some(&json!({"gamestate": null}))));
+    }
+
+    #[test]
+    fn a_reload_backs_off_while_matchzy_is_not_loaded() {
+        let idle = json!({"gamestate": "none"});
+        let live = json!({"gamestate": "live"});
+        // The normal cases: reload when idle, wait while a match is loaded.
+        assert_eq!(reload_step(Some(&idle), None), ReloadStep::Exec);
+        assert_eq!(reload_step(Some(&live), None), ReloadStep::Wait);
+        assert_eq!(reload_step(None, None), ReloadStep::Wait);
+        assert_eq!(reload_retry_delay(None), secs(10));
+        // MatchZy silent (plugin stack not loaded): keep trying for a few
+        // minutes, then stop asking every 10 seconds.
+        assert_eq!(reload_step(None, Some(secs(60))), ReloadStep::Wait);
+        assert_eq!(reload_retry_delay(Some(secs(60))), secs(10));
+        assert_eq!(reload_retry_delay(Some(secs(179))), secs(10));
+        assert_eq!(reload_retry_delay(Some(secs(180))), secs(300));
+        assert_eq!(reload_retry_delay(Some(secs(86_400))), secs(300));
+        assert_eq!(reload_step(None, Some(secs(86_400))), ReloadStep::Wait);
+        // A short silence (a map change) changes nothing…
+        assert_eq!(reload_step(Some(&idle), Some(secs(60))), ReloadStep::Exec);
+        assert_eq!(reload_step(Some(&live), Some(secs(60))), ReloadStep::Wait);
+        // …but when it answers again after a long one it has just been
+        // loaded, and read the config doing so: nothing left to do, whatever
+        // state it is in by now.
+        assert_eq!(reload_step(Some(&idle), Some(secs(180))), ReloadStep::Done);
+        assert_eq!(reload_step(Some(&live), Some(secs(3600))), ReloadStep::Done);
     }
 
     #[test]
@@ -2351,7 +2753,7 @@ esac
         // Never while a job runs, not even on connect; and the turn is kept.
         updater.start("mods", JOB, "portal").await.unwrap();
         assert!(!updater.verify_config(true, t0 + secs(1000)).await);
-        updater.settle_pending(None, Instant::now() + secs(61), false);
+        updater.settle_pending_gone(Instant::now() + secs(61));
         assert!(updater.verify_config(false, t0 + secs(1000)).await);
 
         // Not on a host without the helper; a failing systemctl is not fatal.
